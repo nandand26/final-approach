@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Aviation Fleet & Operational Intelligence Agent
 
 A multi-agent aviation operations assistant built with **LangGraph**, **Streamlit**, **OpenSky Network** (physical ADS-B), **FlightAware / NOAA / Tavily** (commercial + web), **OpenAI** (supervisor planning), and **Google Gemini** (OpenSky tool planning + final synthesis).
@@ -525,3 +526,7 @@ streamlit run app.py
 ## License / status
 
 Personal / portfolio project. Not affiliated with FlightAware, OpenSky Network, NOAA, Google, OpenAI, Tavily, or any airline.
+=======
+# final-approach
+FinalApproach — a multi-agent system that plans, fetches live flight ops and ADS-B, and lands a clear answer.
+>>>>>>> 096434a98e2609c8aaaeb5237fd2df568b829871
