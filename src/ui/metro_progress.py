@@ -22,19 +22,29 @@ from typing import Any
 NODE_DISPLAY_MAP = {
     "supervisor": "🧭 Flight Ops Router",
     "spoke_1_node": "🛰️ Physical Airspace Radar Engine",
-    "spoke_2_node": "🛫 Commercial & Web Engine",
+    "spoke_2_node": "🛫 Commercial Flight Engine",
+    "spoke_3_node": "🔎 Web Research Engine",
     "synthesizer": "📋 Intelligence Synthesizer",
     # Real LangGraph node / worker ids
     "spoke_1_opensky": "🛰️ Physical Airspace Radar Engine",
-    "spoke_2_liveops": "🛫 Commercial & Web Engine",
+    "spoke_2_liveops": "🛫 Commercial Flight Engine",
+    "spoke_3_websearch": "🔎 Web Research Engine",
     "Spoke_1_OpenSky": "🛰️ Physical Airspace Radar Engine",
-    "Spoke_2_LiveOps": "🛫 Commercial & Web Engine",
+    "Spoke_2_LiveOps": "🛫 Commercial Flight Engine",
+    "Spoke_3_WebSearch": "🔎 Web Research Engine",
     "FINISH": "📋 Intelligence Synthesizer",
+}
+
+_VALID_PLAN_WORKERS = {
+    "Spoke_1_OpenSky",
+    "Spoke_2_LiveOps",
+    "Spoke_3_WebSearch",
 }
 
 # Canonical metro track (visual order). Skipped spokes stay muted gray.
 _CANONICAL_TRACK: list[tuple[str, str, str | None]] = [
     ("supervisor", "supervisor", None),
+    ("spoke_3", "spoke", "Spoke_3_WebSearch"),
     ("spoke_2", "spoke", "Spoke_2_LiveOps"),
     ("spoke_1", "spoke", "Spoke_1_OpenSky"),
     ("finish", "finish", None),
@@ -89,13 +99,26 @@ def node_display_name(node_name: str) -> str:
     return NODE_DISPLAY_MAP.get(node_name, node_name.replace("_", " "))
 
 
-def build_canonical_route(plan: list[str]) -> list[Station]:
+def _plan_worker_names(plan: list[Any]) -> list[str]:
+    """Normalize plan items (strings or {worker, task} dicts) to worker names."""
+    names: list[str] = []
+    for item in plan or []:
+        if isinstance(item, dict):
+            worker = str(item.get("worker") or "").strip()
+        else:
+            worker = str(item or "").strip()
+        if worker in _VALID_PLAN_WORKERS:
+            names.append(worker)
+    return names
+
+
+def build_canonical_route(plan: list[Any]) -> list[Station]:
     """Fixed metro line; spokes not in `plan` start as skipped.
 
     Track sequence:
-      Flight Ops Router → Commercial & Web → Physical Airspace → Synthesizer
+      Flight Ops Router → Web Research → Commercial Flight → Physical Airspace → Synthesizer
     """
-    planned = set(plan)
+    planned = set(_plan_worker_names(plan))
     stations: list[Station] = []
     for key, kind, worker in _CANONICAL_TRACK:
         if kind == "supervisor":
@@ -121,7 +144,7 @@ def build_canonical_route(plan: list[str]) -> list[Station]:
     return stations
 
 
-def build_route_from_plan(plan: list[str]) -> list[Station]:
+def build_route_from_plan(plan: list[Any]) -> list[Station]:
     """Alias used by app / tests — builds the fixed canonical metro track."""
     return build_canonical_route(plan)
 
@@ -130,7 +153,7 @@ def parse_plan_workers_from_note(note: str) -> list[str] | None:
     """Read the planned spokes out of a supervisor turn_note string.
 
     Returns:
-      - list of spoke names, or [] for "empty plan / chat only"
+      - list of spoke names, or [] for empty plan / chat only
       - None if this note is not a plan-generation note (e.g. a later hop)
     """
     match = re.search(
@@ -143,15 +166,27 @@ def parse_plan_workers_from_note(note: str) -> list[str] | None:
             return []
         return None
 
-    raw = match.group(1).replace("'", '"')
+    raw_list = match.group(1)
+    workers: list[str] = []
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw_list.replace("'", '"'))
+        if isinstance(parsed, list):
+            workers = _plan_worker_names(parsed)
     except json.JSONDecodeError:
-        parsed = re.findall(r"Spoke_[12]_(?:OpenSky|LiveOps)", match.group(1))
+        workers = []
 
-    if not isinstance(parsed, list):
-        return None
-    return [str(x) for x in parsed if str(x) in {"Spoke_1_OpenSky", "Spoke_2_LiveOps"}]
+    if not workers:
+        found = re.findall(
+            r"Spoke_[123]_(?:OpenSky|LiveOps|WebSearch)",
+            raw_list,
+        )
+        seen: set[str] = set()
+        for w in found:
+            if w in _VALID_PLAN_WORKERS and w not in seen:
+                workers.append(w)
+                seen.add(w)
+
+    return [w for w in workers if w in _VALID_PLAN_WORKERS]
 
 
 # ---------------------------------------------------------------------------
@@ -199,19 +234,42 @@ def _first_dict_blob(text: str) -> dict[str, Any] | None:
 
 
 def _looks_like_api_error(payload: dict[str, Any] | None, note: str = "") -> bool:
-    """True when a spoke returned an API / rate-limit style failure."""
+    """True when a spoke returned an API / rate-limit style failure.
+
+    Prefer structured payload fields. Avoid bare ``"429" in note`` — Tavily
+    relevance scores like ``0.57064295`` contain that digit run and were
+    false-flagging successful Web Research as a warning.
+    """
+    if isinstance(payload, dict):
+        if payload.get("ok") is False:
+            return True
+        source = str(payload.get("source") or "").lower()
+        if "error" in source or source.endswith("_fallback"):
+            return True
+        if payload.get("error") or payload.get("detail"):
+            return True
+        # Known live/mock success wrappers: trust source, skip fragile text scans.
+        if source in {
+            "tavily",
+            "flightaware",
+            "opensky",
+            "mock_tavily",
+            "mock_flightaware",
+            "skipped",
+        }:
+            return False
+
     joined = note.lower()
-    if "rate limit" in joined or "rate-limit" in joined or "429" in joined:
+    if "rate limit" in joined or "rate-limit" in joined or "too many requests" in joined:
+        return True
+    # HTTP 429 as its own token — not digits inside floats/ids (…64295…).
+    if re.search(r"(?<![\d.])429(?![\d.])", joined):
         return True
     if not isinstance(payload, dict):
-        return "error" in joined and ("opensky" in joined or "flightaware" in joined or "tavily" in joined)
-    if payload.get("ok") is False:
-        return True
-    source = str(payload.get("source") or "").lower()
-    if "error" in source or source.endswith("_fallback"):
-        return True
-    err = payload.get("error") or payload.get("detail")
-    return bool(err)
+        return "error" in joined and (
+            "opensky" in joined or "flightaware" in joined or "tavily" in joined
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +496,16 @@ def spoke2_summary(note: str, fa_payload: dict[str, Any] | None) -> str:
     ident_match = re.search(r"Resolved ident from conversation:\s*(\S+)", note)
     if ident_match and ident_match.group(1) != "NONE":
         return f"Commercial lookup for {ident_match.group(1)}"
-    return "Commercial & web pass complete"
+    return "Commercial flight pass complete"
+
+
+def spoke3_summary(note: str) -> str:
+    query_match = re.search(r"\[Spoke_3_WebSearch\]\s*Query:\s*(.+)", note)
+    if query_match:
+        return f"Researched: {_trim(query_match.group(1), 80)}"
+    if "tavily_error" in note.lower():
+        return "Web research warning"
+    return "Web research complete"
 
 
 def format_spoke1_card(note: str) -> str:
@@ -511,17 +578,10 @@ def format_spoke1_card(note: str) -> str:
 
 
 def format_spoke2_card(note: str) -> str:
+    """Commercial Flight Engine card — FlightAware (+ NOAA if present). No Tavily."""
     fa_payload: dict[str, Any] | None = None
-    tv_payload: dict[str, Any] | None = None
 
-    fa_part = ""
-    tv_part = ""
-    if "Tavily research:" in note:
-        fa_part, tv_part = note.split("Tavily research:", 1)
-    else:
-        fa_part = note
-
-    for blob in _extract_json_blobs(fa_part):
+    for blob in _extract_json_blobs(note):
         if isinstance(blob, dict) and (
             "headline" in blob
             or "flights" in blob
@@ -531,12 +591,23 @@ def format_spoke2_card(note: str) -> str:
             fa_payload = blob
             break
     if fa_payload is None:
-        for blob in _extract_json_blobs(fa_part):
+        for blob in _extract_json_blobs(note):
             if isinstance(blob, dict):
                 fa_payload = blob
                 break
 
-    for blob in _extract_json_blobs(tv_part or note):
+    if fa_payload is not None:
+        return format_flightaware_card(fa_payload)
+    return "#### Live flight\n\n_Live flight details unavailable._"
+
+
+def format_spoke3_card(note: str) -> str:
+    """Web Research Engine card — Tavily results."""
+    query_match = re.search(r"\[Spoke_3_WebSearch\]\s*Query:\s*(.+)", note)
+    query = query_match.group(1).strip() if query_match else ""
+
+    tv_payload: dict[str, Any] | None = None
+    for blob in _extract_json_blobs(note):
         if isinstance(blob, dict) and (
             str(blob.get("source", "")).startswith("tavily")
             or str(blob.get("source", "")).startswith("mock_tavily")
@@ -546,23 +617,18 @@ def format_spoke2_card(note: str) -> str:
             tv_payload = blob
             break
 
-    parts: list[str] = []
-    if fa_payload is not None:
-        parts.append(format_flightaware_card(fa_payload))
-    else:
-        parts.append("#### Live flight\n\n_Live flight details unavailable._")
-
+    parts: list[str] = ["#### Web research (Tavily)"]
+    if query:
+        parts.append(f"**Query:** {_trim(query, 160)}")
     if tv_payload is not None:
         parts.append(format_tavily_card(tv_payload))
     else:
-        parts.append("#### Related reading\n\n_Web search not connected._")
-
-    return "\n\n---\n\n".join(parts)
+        parts.append("_Web search payload unavailable._")
+    return "\n\n".join(parts)
 
 
 def _parse_spoke2_fa(note: str) -> dict[str, Any] | None:
-    fa_part = note.split("Tavily research:", 1)[0] if "Tavily research:" in note else note
-    for blob in _extract_json_blobs(fa_part):
+    for blob in _extract_json_blobs(note):
         if isinstance(blob, dict) and (
             "headline" in blob
             or "flights" in blob
@@ -570,7 +636,7 @@ def _parse_spoke2_fa(note: str) -> dict[str, Any] | None:
             or blob.get("source") in {"skipped", "mock_flightaware", "flightaware_error_fallback"}
         ):
             return blob
-    return _first_dict_blob(fa_part)
+    return _first_dict_blob(note)
 
 
 def format_supervisor_card(note: str, plan: list[str] | None) -> str:
@@ -781,6 +847,10 @@ def advance_on_node_update(progress: TurnProgress, node_name: str, update: dict[
         _complete_spoke(progress, "Spoke_2_LiveOps", notes)
         return
 
+    if node_name == "spoke_3_websearch":
+        _complete_spoke(progress, "Spoke_3_WebSearch", notes)
+        return
+
     if node_name == "synthesizer":
         for station in progress.stations:
             if station.status == "active":
@@ -823,12 +893,28 @@ def _complete_spoke(progress: TurnProgress, worker: str, notes: list[str]) -> No
             progress,
             f"{station.label}: {'⚠️ ' if warn else ''}{station.summary}",
         )
+    elif worker == "Spoke_3_WebSearch":
+        detail = format_spoke3_card(joined)
+        payload = _first_dict_blob(joined)
+        warn = _looks_like_api_error(payload, joined) or (
+            "tavily_error" in joined.lower()
+        )
+        summary = spoke3_summary(joined)
+        station.detail_md = detail
+        station.summary = summary if not warn else _trim(
+            str((payload or {}).get("error") or "Web research warning"),
+            100,
+        )
+        station.status = "warn" if warn else "done"
+        _log(
+            progress,
+            f"{station.label}: {'⚠️ ' if warn else ''}{station.summary}",
+        )
     else:
         detail = format_spoke2_card(joined)
         fa = _parse_spoke2_fa(joined)
         warn = _looks_like_api_error(fa, joined)
-        # Also warn if Tavily error-only and FA failed
-        if "tavily_error" in joined.lower() or "flightaware_error" in joined.lower():
+        if "flightaware_error" in joined.lower():
             warn = True
         summary = spoke2_summary(joined, fa)
         station.detail_md = detail

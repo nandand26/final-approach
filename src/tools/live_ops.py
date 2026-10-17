@@ -30,6 +30,7 @@ from typing import Any
 import certifi
 import requests
 from langchain_core.tools import tool
+from langsmith import traceable
 from pydantic import BaseModel, Field
 
 # FlightAware AeroAPI base URL
@@ -326,6 +327,14 @@ def _icao_ident_candidates(ident: str) -> list[str]:
     return candidates
 
 
+@traceable(
+    name="FlightAware_AeroAPI_GET",
+    run_type="tool",
+    hide_inputs=lambda inputs: {
+        "ident": inputs.get("ident"),
+        "api_key": "[REDACTED]",
+    },
+)
 def _aeroapi_get_flights(ident: str, api_key: str) -> dict[str, Any]:
     """GET /flights/{ident} via requests+certifi.
 
@@ -360,6 +369,7 @@ def _aeroapi_get_flights(ident: str, api_key: str) -> dict[str, Any]:
 #   Metro UI shows a short "Weather nearby" block from that — not raw METAR.
 # ---------------------------------------------------------------------------
 
+@traceable(name="NOAA_METAR_Batch_GET", run_type="tool")
 def fetch_noaa_metars(icao_codes: list[str]) -> dict[str, dict]:
     """Fetch METARs for one or more ICAO stations in a SINGLE NOAA request.
 

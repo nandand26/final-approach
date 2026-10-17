@@ -15,6 +15,7 @@ Security idea in one line:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,22 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Load API keys from .env (OpenAI, Gemini, FlightAware, Tavily, …)
-load_dotenv(ROOT / ".env")
+# Load API keys from .env (OpenAI, Gemini, FlightAware, Tavily, LangSmith, …)
+load_dotenv(ROOT / ".env", override=True)
+
+# Mirror LangSmith env aliases for newer SDKs (not UI).
+# Regional SaaS matters: APAC/EU keys 403 on the default US endpoint.
+if (os.getenv("LANGCHAIN_TRACING_V2") or "").strip().lower() in {"1", "true", "yes"}:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+if os.getenv("LANGCHAIN_API_KEY") and not os.getenv("LANGSMITH_API_KEY"):
+    os.environ["LANGSMITH_API_KEY"] = os.environ["LANGCHAIN_API_KEY"]
+if os.getenv("LANGCHAIN_PROJECT") and not os.getenv("LANGSMITH_PROJECT"):
+    os.environ["LANGSMITH_PROJECT"] = os.environ["LANGCHAIN_PROJECT"]
+_ls_endpoint = os.getenv("LANGCHAIN_ENDPOINT") or os.getenv("LANGSMITH_ENDPOINT")
+if _ls_endpoint:
+    os.environ["LANGCHAIN_ENDPOINT"] = _ls_endpoint
+    os.environ["LANGSMITH_ENDPOINT"] = _ls_endpoint
 
 # Imports after path/env so models pick up keys at import time.
 from src.db.auth_db import (  # noqa: E402
@@ -55,15 +70,36 @@ from src.ui.metro_progress import (  # noqa: E402
 )
 
 
-def _thread_config(thread_id: str) -> dict[str, Any]:
+def _thread_config(
+    thread_id: str,
+    user_id: str | None = None,
+    *,
+    entrypoint: str = "streamlit",
+) -> dict[str, Any]:
     """Config passed into every LangGraph call for this chat.
 
     - thread_id  → which memory bucket to use (this chat only)
     - recursion_limit → how many supervisor↔spoke hops we allow before abort
+    - run_name / tags / metadata → LangSmith run tagging for this turn
+
+    Tags are built dynamically from entrypoint + optional user_id so a future
+    API/notebook caller can pass entrypoint="api" instead of hardcoding UI labels.
     """
+    tags = [f"entrypoint:{entrypoint}"]
+    metadata: dict[str, Any] = {
+        "thread_id": thread_id,
+        "entrypoint": entrypoint,
+    }
+    if user_id:
+        tags.append(f"user:{user_id}")
+        metadata["user_id"] = user_id
     return {
-        "recursion_limit": 16,
+        # Up to 9 spoke hops (2+2+5) plus supervisor visits → keep headroom.
+        "recursion_limit": 22,
         "configurable": {"thread_id": thread_id},
+        "run_name": "Aviation_Ops_Turn",
+        "tags": tags,
+        "metadata": metadata,
     }
 
 
@@ -312,9 +348,14 @@ if prompt:
     # and tool notes cannot leak into this question.
     graph_input = {
         "messages": [HumanMessage(content=prompt)],
+        # Stamp Google OAuth identity so Mem0 can scope cross-session memory.
+        "user_id": current_user_id,
         "turn_notes": [],  # empty list = "clear scratch" (see merge_turn_notes)
         "plan": [],        # empty list = wipe last turn's spoke queue
         "next_worker": "",
+        "current_task": "",  # hop-local sub-query cleared each turn
+        # Memory Gate default OFF; supervisor may flip True for explicit prefs only.
+        "extract_memory": False,
         "final_report": "",
     }
 
@@ -326,7 +367,11 @@ if prompt:
         progress = TurnProgress()
         # Live track also mirrored in session_state so a mid-turn rerun can recover
         st.session_state["live_metro_progress"] = progress
-        thread_cfg = _thread_config(active_thread_id)
+        thread_cfg = _thread_config(
+            active_thread_id,
+            user_id=current_user_id,
+            entrypoint="streamlit",
+        )
         # Mutable counter (list) — `if prompt:` is module scope, so `nonlocal` is illegal.
         logged_steps = [0]
 
@@ -361,7 +406,7 @@ if prompt:
                         for note in update.get("turn_notes") or []:
                             collected_turn_notes.append(str(note))
 
-                        # Move metro lights + build layman cards from this node
+                        # Move metro lights from this node update
                         advance_on_node_update(progress, str(node_name), update)
                         st.session_state["live_metro_progress"] = progress
                         _flush_status_log(status_box)
@@ -423,11 +468,24 @@ if prompt:
             ):
                 prior_messages = prior_messages + [HumanMessage(content=prompt)]
 
+            # Honor Memory Gate if supervisor already wrote it into the checkpoint.
+            extract_memory_flag = False
+            try:
+                snap = app_graph.get_state(thread_cfg)
+                extract_memory_flag = bool(
+                    (snap.values or {}).get("extract_memory")
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
             partial_state = {
                 "messages": prior_messages,
+                "user_id": current_user_id,
                 "turn_notes": collected_turn_notes,
                 "plan": [],
                 "next_worker": "FINISH",
+                "current_task": "",
+                "extract_memory": extract_memory_flag,
                 "final_report": "",
             }
             try:

@@ -7,12 +7,20 @@ from typing import Annotated, Any, TypedDict
 # add_messages tells LangGraph to APPEND new messages instead of replacing them
 from langgraph.graph.message import add_messages
 
+# Mem0 (`mem0ai`) is an optional long-term memory backend. Do NOT import it here:
+# `import mem0` has side effects (creates ~/.mem0) and must stay lazy in nodes.py.
+# AgentState.user_id is the identity stamp Mem0 scopes against.
+
 # MESSAGE_WINDOW: hard cap on durable chat history kept in AgentState.messages.
 # Only the newest N user+assistant messages survive; older ones are dropped.
 MESSAGE_WINDOW = 10
 
-# Hard cap: each spoke may run at most this many times in one user-message turn
-MAX_SPOKE_EXECUTIONS_PER_TURN = 2
+# Per-spoke hard caps for a single user-message turn (Plan-and-Execute queue).
+SPOKE_CAPS = {
+    "Spoke_1_OpenSky": 2,
+    "Spoke_2_LiveOps": 2,
+    "Spoke_3_WebSearch": 5,
+}
 
 
 def add_messages_window(left: list, right: list) -> list:
@@ -53,19 +61,34 @@ class AgentState(TypedDict):
     # Rolling chat memory (user + final answers only), capped at MESSAGE_WINDOW.
     messages: Annotated[list, add_messages_window]
 
+    # Permanent Google OAuth identity (sub / email fallback from auth_sessions.db).
+    # Used as Mem0 `user_id` so preferences survive across threads and sessions.
+    # Not a chat transcript field — identity stamp refreshed by app.py each turn.
+    user_id: str  # this is for memzero
+
     # --- turn-local scratch (must reset every new user message) ---
     # Supervisor/spoke internals for THIS ask only.
     # Reset rule: app passes turn_notes=[] → merge_turn_notes clears it.
     turn_notes: Annotated[list[str], merge_turn_notes]
 
-    # Plan-and-Execute queue: ordered spokes still left to run this turn.
+    # Plan-and-Execute queue: ordered sub-tasks still left to run this turn.
+    # Each item is {"worker": Spoke_*, "task": "<sub-query>"}.
     # No Annotated reducer → each write REPLACES the whole list (not append).
     # Reset rule: app passes plan=[] at turn start so last turn's queue cannot leak.
-    # Supervisor pops the head into next_worker; remaining stays here.
-    plan: list[str]
+    # Supervisor pops the head into next_worker + current_task; remaining stays here.
+    plan: list[dict[str, str]]
 
-    # Current hop after a pop: Spoke_1_OpenSky | Spoke_2_LiveOps | FINISH
+    # Current hop after a pop: Spoke_1_OpenSky | Spoke_2_LiveOps | Spoke_3_WebSearch | FINISH
     next_worker: str
+
+    # Hop-local sub-query the active spoke should execute (from plan head's "task").
+    # Cleared to "" when FINISH. Replace semantics (no reducer).
+    current_task: str
+
+    # Memory Gate: supervisor sets True only when this turn contains an explicit,
+    # durable preference/rule worth writing to Mem0. Synthesizer adds only if True.
+    # Reset rule: app.py passes extract_memory=False at every new prompt.
+    extract_memory: bool
 
     # Synthesizer's final answer string for this turn
     final_report: str
