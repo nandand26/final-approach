@@ -1,7 +1,8 @@
 """Metro-board progress UI for one agent turn.
 
 Plain-English idea:
-  While the agent runs, show a fixed "train line" of stations.
+  While the agent runs, show a "train line" of stations ordered from the
+  supervisor plan list (Router → planned spokes → Synthesizer).
   Lights change as work moves along: waiting → running → done / skipped / warn.
   When a spoke finishes, expanders show a SHORT human-readable card — not raw JSON.
 
@@ -41,14 +42,12 @@ _VALID_PLAN_WORKERS = {
     "Spoke_3_WebSearch",
 }
 
-# Canonical metro track (visual order). Skipped spokes stay muted gray.
-_CANONICAL_TRACK: list[tuple[str, str, str | None]] = [
-    ("supervisor", "supervisor", None),
-    ("spoke_3", "spoke", "Spoke_3_WebSearch"),
-    ("spoke_2", "spoke", "Spoke_2_LiveOps"),
-    ("spoke_1", "spoke", "Spoke_1_OpenSky"),
-    ("finish", "finish", None),
-]
+# Stable station keys for each spoke worker (used when building plan-ordered tracks).
+_SPOKE_STATION_KEY = {
+    "Spoke_1_OpenSky": "spoke_1",
+    "Spoke_2_LiveOps": "spoke_2",
+    "Spoke_3_WebSearch": "spoke_3",
+}
 
 # Metro light icons (emoji fallback; HTML pills add color/pulse)
 _STATUS_ICON = {
@@ -112,41 +111,73 @@ def _plan_worker_names(plan: list[Any]) -> list[str]:
     return names
 
 
-def build_canonical_route(plan: list[Any]) -> list[Station]:
-    """Fixed metro line; spokes not in `plan` start as skipped.
+def build_route_from_plan(plan: list[Any]) -> list[Station]:
+    """Build the metro line from the supervisor plan list (execution order).
 
     Track sequence:
-      Flight Ops Router → Web Research → Commercial Flight → Physical Airspace → Synthesizer
+      Flight Ops Router → <spokes in plan order, unique first-seen> → Synthesizer
+
+    Unplanned spokes are omitted (not shown as skipped placeholders).
     """
-    planned = set(_plan_worker_names(plan))
-    stations: list[Station] = []
-    for key, kind, worker in _CANONICAL_TRACK:
-        if kind == "supervisor":
-            label = NODE_DISPLAY_MAP["supervisor"]
-        elif kind == "finish":
-            label = NODE_DISPLAY_MAP["synthesizer"]
-        else:
-            label = human_worker_label(worker or key)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for worker in _plan_worker_names(plan):
+        if worker not in seen:
+            ordered.append(worker)
+            seen.add(worker)
 
-        status = "pending"
-        if kind == "spoke" and worker and worker not in planned:
-            status = "skipped"
-
+    stations: list[Station] = [
+        Station(
+            key="supervisor",
+            kind="supervisor",
+            label=NODE_DISPLAY_MAP["supervisor"],
+            status="pending",
+        )
+    ]
+    for worker in ordered:
         stations.append(
             Station(
-                key=key,
-                kind=kind,
-                label=label,
+                key=_SPOKE_STATION_KEY.get(worker, worker),
+                kind="spoke",
+                label=human_worker_label(worker),
                 worker=worker,
-                status=status,
+                status="pending",
             )
         )
+    stations.append(
+        Station(
+            key="finish",
+            kind="finish",
+            label=NODE_DISPLAY_MAP["synthesizer"],
+            status="pending",
+        )
+    )
     return stations
 
 
-def build_route_from_plan(plan: list[Any]) -> list[Station]:
-    """Alias used by app / tests — builds the fixed canonical metro track."""
-    return build_canonical_route(plan)
+def build_canonical_route(plan: list[Any]) -> list[Station]:
+    """Back-compat alias — metro track is plan-ordered now."""
+    return build_route_from_plan(plan)
+
+
+def _plan_from_supervisor_update(update: dict[str, Any]) -> list[str] | None:
+    """Rebuild full spoke order from the supervisor state write.
+
+    On first plan hop the graph pops the head into ``next_worker`` and leaves
+    the remainder in ``plan`` — so full order is ``[next_worker] + plan``.
+    Returns ``None`` when this update is not a plan-generation write.
+    """
+    nxt = str(update.get("next_worker") or "").strip()
+    if not nxt:
+        return None
+    remaining = _plan_worker_names(update.get("plan") or [])
+    if nxt == "FINISH":
+        # Empty-plan bypass (or already drained — caller only uses this
+        # before plan_built, so treat as chat-only → synthesizer).
+        return []
+    if nxt in _VALID_PLAN_WORKERS:
+        return [nxt] + remaining
+    return None
 
 
 def parse_plan_workers_from_note(note: str) -> list[str] | None:
@@ -666,7 +697,11 @@ def metro_strip_markdown(stations: list[Station]) -> str:
 
 
 def metro_strip_html(stations: list[Station]) -> str:
-    """HTML/CSS pill track with pulse on the active station."""
+    """Vertical plan-ordered track (top → bottom = supervisor plan order).
+
+    Horizontal flex-wrap made order look "static"/scrambled; a single column
+    matches the plan list exactly.
+    """
     if not stations:
         return "<p><strong>Route:</strong> Planning…</p>"
 
@@ -685,52 +720,57 @@ def metro_strip_html(stations: list[Station]) -> str:
         "warn": "!",
     }
 
-    css = """
-    <style>
-    @keyframes metro-pulse {
-      0% { box-shadow: 0 0 0 0 rgba(26,115,232,0.45); }
-      70% { box-shadow: 0 0 0 10px rgba(26,115,232,0); }
-      100% { box-shadow: 0 0 0 0 rgba(26,115,232,0); }
-    }
-    .metro-track {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
-      margin: 0.25rem 0 0.75rem 0; font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-    }
-    .metro-pill {
-      display: inline-flex; flex-direction: column; gap: 0.15rem;
-      padding: 0.45rem 0.7rem; border-radius: 10px; min-width: 7.5rem;
-      max-width: 14rem;
-    }
-    .metro-pill .title { font-size: 0.82rem; font-weight: 600; line-height: 1.25; }
-    .metro-pill .meta { font-size: 0.72rem; opacity: 0.9; line-height: 1.2; }
-    .metro-pill.active { animation: metro-pulse 1.4s ease-out infinite; }
-    .metro-pill.skipped .title { opacity: 0.55; }
-    .metro-arrow { color: #8a94a0; font-weight: 700; padding: 0 0.1rem; }
-    </style>
-    """
-
-    chunks = [css, '<div class="metro-track">']
+    # Inline styles only — Streamlit st.markdown strips <style> tags.
+    chunks = [
+        '<div style="display:flex;flex-direction:column;align-items:stretch;'
+        'gap:0.15rem;margin:0.25rem 0 0.75rem 0;'
+        'font-family:IBM Plex Sans,Segoe UI,sans-serif;">'
+    ]
     for i, station in enumerate(stations):
         bg, fg, border = styles.get(station.status, styles["pending"])
         icon = icons.get(station.status, "○")
-        cls = f"metro-pill {station.status}"
         meta = ""
         if station.status == "active":
-            meta = '<div class="meta">In Progress…</div>'
+            meta = (
+                '<div style="font-size:0.72rem;opacity:0.9;margin-top:0.15rem;">'
+                "In Progress…</div>"
+            )
         elif station.status == "warn" and station.summary:
-            meta = f'<div class="meta">⚠ {station.summary}</div>'
+            meta = (
+                '<div style="font-size:0.72rem;opacity:0.9;margin-top:0.15rem;">'
+                f"⚠ {station.summary}</div>"
+            )
         elif station.status == "done" and station.summary:
-            meta = f'<div class="meta">{station.summary}</div>'
+            meta = (
+                '<div style="font-size:0.72rem;opacity:0.9;margin-top:0.15rem;">'
+                f"{station.summary}</div>"
+            )
         elif station.status == "skipped":
-            meta = '<div class="meta">Skipped</div>'
+            meta = (
+                '<div style="font-size:0.72rem;opacity:0.9;margin-top:0.15rem;">'
+                "Skipped</div>"
+            )
 
+        step_no = i + 1
+        title_opacity = "0.55" if station.status == "skipped" else "1"
+        pulse = (
+            "box-shadow:0 0 0 3px rgba(26,115,232,0.25);"
+            if station.status == "active"
+            else ""
+        )
         chunks.append(
-            f'<div class="{cls}" style="background:{bg};color:{fg};border:{border};">'
-            f'<div class="title">{icon} {station.label}</div>'
+            f'<div style="background:{bg};color:{fg};border:{border};{pulse}'
+            f"border-radius:10px;padding:0.5rem 0.75rem;\">"
+            f'<div style="font-size:0.82rem;font-weight:600;line-height:1.25;'
+            f'opacity:{title_opacity};">'
+            f"{step_no}. {icon} {station.label}</div>"
             f"{meta}</div>"
         )
         if i < len(stations) - 1:
-            chunks.append('<span class="metro-arrow">➔</span>')
+            chunks.append(
+                '<div style="color:#8a94a0;font-weight:700;text-align:center;'
+                'line-height:1;padding:0.05rem 0;">↓</div>'
+            )
     chunks.append("</div>")
     return "".join(chunks)
 
@@ -793,17 +833,28 @@ def advance_on_node_update(progress: TurnProgress, node_name: str, update: dict[
 
     # --- First supervisor visit: learn the plan and draw the whole route ---
     if not progress.plan_built and node_name == "supervisor":
-        for note in notes:
-            plan = parse_plan_workers_from_note(note)
-            if plan is None:
-                continue
+        # Prefer the live plan list from state (true execution order).
+        plan = _plan_from_supervisor_update(update)
+        plan_note = next(
+            (n for n in notes if parse_plan_workers_from_note(n) is not None),
+            notes[0] if notes else "",
+        )
+        if plan is None:
+            for note in notes:
+                parsed = parse_plan_workers_from_note(note)
+                if parsed is None:
+                    continue
+                plan = parsed
+                plan_note = note
+                break
+        if plan is not None:
             progress.plan_workers = list(plan)
-            progress.stations = build_canonical_route(plan)
+            progress.stations = build_route_from_plan(plan)
             progress.plan_built = True
             router = _station_by_kind(progress, "supervisor")
             if router:
                 router.status = "done"
-                router.detail_md = format_supervisor_card(note, plan)
+                router.detail_md = format_supervisor_card(str(plan_note), plan)
                 if plan:
                     router.summary = " → ".join(human_worker_label(w) for w in plan)
                     _log(
@@ -1006,7 +1057,8 @@ def render_agent_steps_panel(
     import streamlit as st
 
     if strip_html:
-        st.markdown(strip_html, unsafe_allow_html=True)
+        # st.html keeps markup; st.markdown strips <style> and can scramble layout.
+        st.html(strip_html)
     else:
         st.markdown(strip)
     if status_line:
@@ -1028,7 +1080,7 @@ def render_progress(progress: TurnProgress) -> None:
 
     While running: metro board is fully visible (hero progress).
     When the answer is ready: answer first, board tucked into a collapsed
-    "Agent steps" expander so demos can still open it.
+    "Sequential Plan" expander so demos can still open it.
     """
     import streamlit as st
 
@@ -1059,7 +1111,7 @@ def render_progress(progress: TurnProgress) -> None:
         label = "Partial answer" if progress.is_partial else "Answer"
         st.markdown(f"### {label}")
         st.markdown(progress.final_report)
-        with st.expander("Agent steps", expanded=False):
+        with st.expander("Sequential Plan", expanded=False):
             render_agent_steps_panel(
                 strip=strip,
                 strip_html=strip_html,
@@ -1069,7 +1121,12 @@ def render_progress(progress: TurnProgress) -> None:
             )
         return
 
-    st.markdown("### Metro route")
+    st.markdown("### Sequential Plan")
+    if progress.plan_workers:
+        st.caption(
+            "Plan order: "
+            + " → ".join(human_worker_label(w) for w in progress.plan_workers)
+        )
     render_agent_steps_panel(
         strip=strip,
         strip_html=strip_html,

@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from src.graph.state import SPOKE_CAPS, AgentState
-from src.graph.models import spoke_llm, supervisor_llm
+from src.graph.models import get_spoke_llm, get_supervisor_llm
 from src.mcp_servers.opensky_mcp import OPENSKY_TOOLS, invoke_opensky_tool
 from src.tools.live_ops import flightaware_live_status, tavily_aviation_web_search
 
@@ -581,7 +581,7 @@ def _llm_generate_plan(
     - `memory_facts` are cross-session Mem0 preferences (units, formatting, etc.).
     - `extract_memory` is True only for explicit durable preference statements.
     """
-    model = supervisor_llm
+    model = get_supervisor_llm()
     if model is None:
         return (
             _heuristic_plan(user_text, history_blob),
@@ -852,15 +852,31 @@ class OpenSkyToolPlan(BaseModel):
     )
 
 
+# Wall-clock cap for Gemini OpenSky tool planning. Gemini 429 retries can
+# otherwise stall Spoke 1 for minutes (SDK has no reliable default timeout).
+_OPENSKY_PLAN_LLM_TIMEOUT_SEC = 20.0
+
+
+def _extract_opensky_icao24(user_text: str) -> str | None:
+    """Six-char ADS-B hex, not a marketed airline flight like AI101."""
+    text = user_text.strip()
+    # Prefer explicit hex that is not purely letters+digits flight-shaped
+    for match in re.finditer(r"\b([0-9A-Fa-f]{6})\b", text):
+        token = match.group(1)
+        # Airline idents like "AI0101" are rare; real hex usually has a-f or mixed.
+        if re.fullmatch(r"[A-Za-z]{2,3}\d{1,4}", token):
+            continue
+        return token.lower()
+    return None
+
+
 def _heuristic_opensky_plan(user_text: str) -> OpenSkyToolPlan:
     """Regex/keyword fallback when Gemini structured planning is unavailable."""
     text = user_text.strip()
     lower = text.lower()
     now = int(time.time())
 
-    # icao24: six hex chars, not a common English word
-    hex_match = re.search(r"\b([0-9A-Fa-f]{6})\b", text)
-    icao24 = hex_match.group(1).lower() if hex_match else None
+    icao24 = _extract_opensky_icao24(text)
 
     # Airport ICAO (4 letters) near arrival/departure words
     apt_match = re.search(
@@ -879,7 +895,7 @@ def _heuristic_opensky_plan(user_text: str) -> OpenSkyToolPlan:
     if "track" in lower or "trajectory" in lower or "waypoint" in lower:
         return OpenSkyToolPlan(
             tool="get_aircraft_trajectory_track",
-            icao24=icao24 or "3c675a",
+            icao24=icao24,
             t=0,
         )
     if "arrival" in lower and airport:
@@ -899,49 +915,82 @@ def _heuristic_opensky_plan(user_text: str) -> OpenSkyToolPlan:
     if "history" in lower or "legs" in lower or "past flights" in lower:
         return OpenSkyToolPlan(
             tool="get_aircraft_flight_history",
-            icao24=icao24 or "3c675a",
+            icao24=icao24,
             begin=now - 24 * 3600,
             end=now,
         )
 
-    # Default physical ask → live telemetry
+    # Default physical ask → live telemetry (icao24 may be None → soft error)
     return OpenSkyToolPlan(
         tool="get_live_aircraft_telemetry",
-        icao24=icao24 or "3c675a",
+        icao24=icao24,
         bbox=None,
     )
 
 
 def _plan_opensky_tool(user_text: str) -> tuple[OpenSkyToolPlan, str]:
-    """Ask Gemini which OpenSky tool to call; fall back to heuristics."""
-    model = spoke_llm
+    """Ask Gemini which OpenSky tool to call; fall back to heuristics.
+
+    Skips the LLM when there is no icao24/airport signal (commercial flight
+    numbers alone cannot key OpenSky) so Spoke 1 does not stall on Gemini.
+    """
+    lower = user_text.lower()
+    has_hex = _extract_opensky_icao24(user_text) is not None
+    has_airport = bool(
+        re.search(
+            r"\b(?:at|airport|arrivals?|departures?|into|out of)\s+[A-Za-z]{4}\b",
+            user_text,
+            flags=re.IGNORECASE,
+        )
+        or (
+            ("arrival" in lower or "departure" in lower)
+            and re.search(r"\b[A-Z]{4}\b", user_text.upper())
+        )
+    )
+    if not has_hex and not has_airport:
+        return _heuristic_opensky_plan(user_text), "heuristic_no_icao24"
+
+    model = get_spoke_llm()
     if model is not None:
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
         try:
             structured = model.with_structured_output(OpenSkyToolPlan)
-            plan = structured.invoke(
-                [
-                    SystemMessage(
-                        content=(
-                            "You select ONE OpenSky Network tool for physical ADS-B airspace data.\n"
-                            "Tools:\n"
-                            "- get_live_aircraft_telemetry(icao24, bbox?): live vectors\n"
-                            "- get_airport_arrivals(airport ICAO, begin, end)\n"
-                            "- get_airport_departures(airport ICAO, begin, end)\n"
-                            "- get_aircraft_flight_history(icao24, begin, end)\n"
-                            "- get_aircraft_trajectory_track(icao24, t?)\n"
-                            "DO NOT select tools for commercial flight numbers (AI8303), schedules, "
-                            "A380 equipment, or METAR — those belong to Spoke 2.\n"
-                            "icao24 must be 6 hex chars. Airports must be 4-letter ICAO."
-                        )
-                    ),
-                    HumanMessage(content=user_text),
-                ]
-            )
+
+            def _invoke() -> Any:
+                return structured.invoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                "You select ONE OpenSky Network tool for physical ADS-B airspace data.\n"
+                                "Tools:\n"
+                                "- get_live_aircraft_telemetry(icao24, bbox?): live vectors\n"
+                                "- get_airport_arrivals(airport ICAO, begin, end)\n"
+                                "- get_airport_departures(airport ICAO, begin, end)\n"
+                                "- get_aircraft_flight_history(icao24, begin, end)\n"
+                                "- get_aircraft_trajectory_track(icao24, t?)\n"
+                                "DO NOT select tools for commercial flight numbers (AI8303), schedules, "
+                                "A380 equipment, or METAR — those belong to Spoke 2.\n"
+                                "icao24 must be 6 hex chars. Airports must be 4-letter ICAO."
+                            )
+                        ),
+                        HumanMessage(content=user_text),
+                    ]
+                )
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                plan = pool.submit(_invoke).result(timeout=_OPENSKY_PLAN_LLM_TIMEOUT_SEC)
             if isinstance(plan, dict):
                 plan = OpenSkyToolPlan.model_validate(plan)
             if plan.tool not in OPENSKY_TOOLS:
                 raise ValueError(f"Invalid tool {plan.tool}")
             return plan, "llm_structured"
+        except FuturesTimeout:
+            logger.warning(
+                "OpenSky tool planning exceeded %.0fs; using heuristic plan.",
+                _OPENSKY_PLAN_LLM_TIMEOUT_SEC,
+            )
         except Exception:
             logger.exception("OpenSky tool planning failed; using heuristic plan.")
 
@@ -954,7 +1003,12 @@ def spoke_1_opensky_node(state: AgentState) -> dict:
     Plans one OpenSky tool call (structured LLM or heuristic), invokes the
     matching MCP tool function, and writes the JSON result into turn_notes.
     """
-    user_text = _latest_user_text(state) or "live aircraft telemetry"
+    # Prefer hop-local supervisor task (may mention icao24 from prior Spoke 2).
+    user_text = (
+        str(state.get("current_task") or "").strip()
+        or _latest_user_text(state)
+        or "live aircraft telemetry"
+    )
     history = _conversation_texts(state, limit=4)
     planning_text = user_text
     if history:
@@ -1164,7 +1218,7 @@ def spoke_3_websearch_node(state: AgentState) -> dict:
     if prior_spoke_outputs:
         # Chained path: something already ran (OpenSky / LiveOps / earlier WebSearch).
         # One Gemini call can fold concrete facts into a sharper Tavily query.
-        model = spoke_llm
+        model = get_spoke_llm()
         if model is not None:
             try:
                 # Cap size: last 4 spoke notes, each truncated, so the refine prompt stays small.
@@ -1233,7 +1287,7 @@ def synthesizer_node(state: AgentState) -> dict:
     resolved = _resolve_flight_ident(state)  # REVIEW: bind pronouns to a flight
     opensky_block = _format_opensky_durable_block(chunks)
 
-    model = spoke_llm
+    model = get_spoke_llm()
     if model is not None and chunks:
         try:
             response = model.invoke(

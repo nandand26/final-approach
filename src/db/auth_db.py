@@ -190,19 +190,24 @@ def create_new_thread(
     user_id: str,
     title: str,
     db_path: Path = AUTH_DB_PATH,
+    *,
+    thread_id: str | None = None,
 ) -> dict[str, str]:
     """Create a new thread row bound to one user.
 
-    UUID generation happens here so the function directly matches app UX:
-    "+ New Chat" -> create row -> return new thread_id.
+    Pass ``thread_id`` when persisting a draft UUID that already lived in
+    Streamlit session state (saved only after the first user message).
+    Otherwise a fresh UUID is generated.
     """
     import uuid
 
     clean_user_id = str(user_id).strip()
-    clean_thread_id = str(uuid.uuid4()) # Generate a new UUID for the thread using the uuid4 function which is a 128-bit universally unique identifier (UUID)
+    clean_thread_id = str(thread_id).strip() if thread_id else str(uuid.uuid4())
     clean_title = str(title).strip() or "New Chat"
     if not clean_user_id:
         raise ValueError("create_new_thread requires non-empty user_id")
+    if not clean_thread_id:
+        raise ValueError("create_new_thread requires non-empty thread_id")
 
     conn = _connect(db_path)
     try:
@@ -221,5 +226,27 @@ def create_new_thread(
             "title": clean_title,
             "created_at": _now_utc_iso(),
         }
+    finally:
+        conn.close()
+
+
+def user_owns_thread(
+    user_id: str,
+    thread_id: str,
+    db_path: Path = AUTH_DB_PATH,
+) -> bool:
+    """True if ``thread_id`` is already persisted and owned by ``user_id``."""
+    conn = _connect(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1 FROM user_threads
+            WHERE user_id = ? AND thread_id = ?
+            LIMIT 1
+            """,
+            (str(user_id).strip(), str(thread_id).strip()),
+        )
+        return cursor.fetchone() is not None
     finally:
         conn.close()

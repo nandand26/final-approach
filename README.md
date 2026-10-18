@@ -351,10 +351,19 @@ Implementation: `src/mcp_servers/opensky_mcp.py` (+ planning in `nodes.py`).
 
 ### Planning
 
-1. Build `planning_text` from latest user ask + recent `messages` (**not** from `turn_notes`).
-2. Gemini `with_structured_output(OpenSkyToolPlan)` → tool name + args.
-3. Fallback: `_heuristic_opensky_plan` (regex hex / airport keywords).
-4. `invoke_opensky_tool(plan.tool, **kwargs)` — drops `None`s; missing required args return `{"ok": false, ...}` JSON instead of crashing the graph.
+1. Prefer hop-local `current_task`, else latest user ask + recent `messages` (**not** from `turn_notes`).
+2. **Fast path (0 LLM):** no `icao24` hex and no airport arrival/departure signal → heuristic only. Commercial flight numbers alone (e.g. AI101) cannot key OpenSky, so Spoke 1 returns a structured soft error instead of stalling on Gemini.
+3. Otherwise Gemini `with_structured_output(OpenSkyToolPlan)` → tool name + args, hard-capped at **~20s** wall clock (Gemini 429 retries otherwise hung the metro on “Physical Airspace”).
+4. Fallback: `_heuristic_opensky_plan` (regex hex / airport keywords). No fake default hex — missing `icao24` yields `{"ok": false, ...}`.
+5. `invoke_opensky_tool(plan.tool, **kwargs)` — drops `None`s; missing required args return soft-error JSON instead of crashing the graph.
+
+### Timeouts
+
+| Call | Timeout |
+|------|---------|
+| OpenSky OAuth token POST | **10s** |
+| OpenSky REST GET (`_opensky_get`) | **10s** |
+| Gemini OpenSky tool planning | **20s** wall clock, then heuristic |
 
 ### Auth
 
@@ -412,11 +421,13 @@ File: `src/ui/metro_progress.py`.
 - Spoke 1 → Physical Airspace Radar Engine  
 - `synthesizer` → Intelligence Synthesizer  
 
-### Fixed track (visual)
+### Plan-ordered track (visual)
 
-Router → Web Research → Commercial Flight → Physical Airspace → Synthesizer  
+The metro board is **not** a static Web → Commercial → Radar layout. On the first supervisor hop it rebuilds from the live plan list:
 
-Spokes not in the plan render as **Skipped**. Active station pulses; API / rate-limit style failures can show **warn** (amber). Spoke 1 live states also drive Altitude / Ground Speed / Vertical Rate / Transponder Hex metrics. Plan notes may list worker names or `{worker, task}` dicts; metro normalizes to worker ids.
+`Router → <spokes in supervisor plan order, unique first-seen> → Synthesizer`
+
+Unplanned spokes are **omitted** (not shown as skipped placeholders). The strip is a **vertical numbered list** (top → bottom = execution order) rendered via `st.html` so Streamlit does not strip layout CSS. A **Plan order:** caption mirrors `plan_workers`. Active station highlights; API / rate-limit style failures can show **warn** (amber). Bare `"429"` digit noise inside Tavily scores is ignored so successful web research is not false-flagged. Spoke 1 live states also drive Altitude / Ground Speed / Vertical Rate / Transponder Hex metrics.
 
 ### Streaming
 
@@ -491,15 +502,15 @@ With tracing on, each Streamlit turn should appear in the LangSmith project as `
 
 | Component | Model path | Uses LLM? |
 |-----------|------------|-----------|
-| Supervisor plan | OpenAI `supervisor_llm` | Yes (`SupervisorPlan`); heuristic fallback |
+| Supervisor plan | OpenAI via `get_supervisor_llm()` | Yes (`SupervisorPlan`); heuristic fallback |
 | Mem0 fact extract / embed (OSS default) | OpenAI via `Memory()` | Yes on `add` / embed on `search` |
-| Spoke 1 tool plan | Gemini `spoke_llm` | Yes (`OpenSkyToolPlan`); regex fallback |
-| OpenSky HTTP tools | — | No |
+| Spoke 1 tool plan | Gemini via `get_spoke_llm()` | Only when icao24/airport signal present (`OpenSkyToolPlan`, ≤20s); else heuristic |
+| OpenSky HTTP tools | — | No (10s timeouts) |
 | Spoke 2 FA / NOAA | — | No |
 | Spoke 3 Tavily | — | No tool LLM; optional Gemini `WebSearchRefine` when chaining |
-| Synthesizer | Gemini `spoke_llm` | Yes (+ deterministic OpenSky durable stamp) |
+| Synthesizer | Gemini via `get_spoke_llm()` | Yes (+ deterministic OpenSky durable stamp) |
 
-Env overrides: `SUPERVISOR_MODEL` (default `gpt-4o-mini`), `SPOKE_MODEL` (default `gemini-3.6-flash`). Mem0 OSS defaults also expect `OPENAI_API_KEY`.
+Env overrides: `SUPERVISOR_MODEL` (default `gpt-4o-mini`), `SPOKE_MODEL` (default **`gemini-2.5-flash`**). Models are built lazily in `models.py` and **rebuild when the env model name changes** so a Streamlit session does not keep a stale Gemini id after you edit `.env` (still restart once after pulling this change). Mem0 OSS defaults also expect `OPENAI_API_KEY`; optional `MEM0_LLM_MODEL=gpt-4o-mini` avoids Mem0’s `gpt-5-mini` + `temperature=0.1` rejection.
 
 ---
 
@@ -520,18 +531,24 @@ aviation_agent/
     ├── db/
     │   └── auth_db.py          # User + thread ownership
     ├── graph/
-    │   ├── models.py           # supervisor_llm / spoke_llm
+    │   ├── models.py           # get_supervisor_llm / get_spoke_llm (env-fresh)
     │   ├── state.py            # AgentState (+ plan/{worker,task}, current_task, SPOKE_CAPS)
     │   ├── nodes.py            # Supervisor, 3 spokes, synthesizer, Mem0 helpers
     │   ├── supervisor.py       # Thin re-export of supervisor_node
     │   └── workflow.py         # StateGraph (3 spokes) + SqliteSaver(checkpoints.db)
     ├── mcp_servers/
-    │   └── opensky_mcp.py      # OpenSky tools + OAuth + invoke dispatch
+    │   └── opensky_mcp.py      # OpenSky tools + OAuth + 10s timeouts + invoke dispatch
     ├── tools/
     │   └── live_ops.py         # FlightAware + Tavily + NOAA (+ @traceable)
     └── ui/
-        └── metro_progress.py   # Metro board + layman cards
+        └── metro_progress.py   # Plan-ordered metro board + layman cards
 ```
+
+### Streamlit UX notes (`app.py`)
+
+- Brand **FinalApproach ✈️** lives in the sidebar (and on the login page); the main chat pane opens with **“Hey, where we off to today?”**
+- Empty chats center the `st.chat_input` dock under the greeting; the first send animates it down to the normal bottom dock.
+- **Login / + New Chat** always opens a **draft** `thread_id` in session only. A row is written to `auth_sessions.db` **only when the user sends the first message** (title = truncated prompt). Empty drafts are never saved.
 
 ---
 
@@ -543,7 +560,7 @@ aviation_agent/
 - Google Cloud OAuth client for Streamlit redirect URI
 - API keys for the paths you want live (OpenAI, Gemini, FlightAware, OpenSky OAuth; Tavily optional)
 - OpenAI key also used by Mem0 OSS defaults for embedding / fact extraction
-- Optional LangSmith API key if you want live tracing in the LangSmith UI
+- Optional LangSmith API key if you want live tracing in the LangSmith UI (use the **regional** API host)
 
 ### Install
 
@@ -564,10 +581,12 @@ TAVILY_API_KEY=...                 # optional
 OPENSKY_CLIENT_ID=...
 OPENSKY_CLIENT_SECRET=...
 SUPERVISOR_MODEL=gpt-4o-mini
-SPOKE_MODEL=gemini-3.6-flash
+SPOKE_MODEL=gemini-2.5-flash
+MEM0_LLM_MODEL=gpt-4o-mini         # optional; avoid gpt-5-mini with Mem0 temp=0.1
 
 # Optional LangSmith (leave TRACING_V2 unset/false to disable)
 LANGCHAIN_TRACING_V2=true
+LANGCHAIN_ENDPOINT=https://apac.api.smith.langchain.com  # required if your org is APAC
 LANGCHAIN_API_KEY=lsv2_pt_...
 LANGCHAIN_PROJECT=FinalApproach
 ```
@@ -582,7 +601,7 @@ Provide the `[auth]` block for Streamlit native Google login. Do **not** commit 
 streamlit run app.py
 ```
 
-On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app.py`. Chat threads then persist across Streamlit restarts on that machine.
+On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app.py`. Chat threads then persist across Streamlit restarts on that machine. After changing `SPOKE_MODEL` / `SUPERVISOR_MODEL`, a full Streamlit restart is safest the first time (getters rebuild on name change thereafter).
 
 ---
 
@@ -630,9 +649,11 @@ On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app
 5. **State vectors are brittle positional APIs** — mitigated by length checks + named mapping in MCP.
 6. **Spoke 2 tool choice is fixed** (FA if ident; NOAA on anomaly) — not Gemini-planned like Spoke 1. Spoke 3→2 ident handoff is still regex on notes, not a structured `discovered_ident` field.
 7. **NOAA enrichment is heuristic** — METAR ≠ proven root cause of delay.
-8. **LangSmith is live tracing, not a formal eval suite** — no golden-set harness / CI assertions yet; bad API keys fail soft (empty project / 403).
+8. **LangSmith is live tracing, not a formal eval suite** — no golden-set harness / CI assertions yet; wrong regional endpoint → 403; bad keys fail soft.
 9. **Metro Agent-steps snapshots** are session-scoped extras (chat text is `SqliteSaver`-backed).
 10. **Offline heuristic planner** has some demo-tuned route phrases; live routing should prefer the supervisor LLM.
+11. **Gemini free-tier quotas are per-model** — exhausting `gemini-3.6-flash` does not mean `gemini-2.5-flash` is dead, but the process must actually load the new `SPOKE_MODEL`.
+12. **OpenSky without icao24 soft-fails fast** — flight-number-only radar asks will not invent a hex.
 
 ---
 
@@ -642,7 +663,8 @@ On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app
 - Why `messages` (durable per `thread_id` in `SqliteSaver`) vs `turn_notes` (scratch) vs Mem0 (prefs per `user_id`).
 - Why OpenSky vs FlightAware vs Tavily is a **three-way domain split**.
 - Why Spoke 3 is fast-path (0 LLM) vs chained refine (1 Gemini) for cost control.
-- Why Spoke 1 uses structured `OpenSkyToolPlan` while Spoke 2 stays tool-only and Spoke 3 only optionally refines.
+- Why Spoke 1 uses structured `OpenSkyToolPlan` (with icao24 gate + 20s planning cap + 10s HTTP) while Spoke 2 stays tool-only and Spoke 3 only optionally refines.
+- Why the metro board is rebuilt from the supervisor plan list (not a static Web→FA→Radar track).
 - Why gated history walk + stopwords for FlightAware idents (bleed vs follow-up).
 - Why synthesizer must be allowed to say **“cannot join”** commercial airframe ↔ ADS-B hex.
 - Why durable OpenSky stamps in `messages` matter for follow-up regex / memory.

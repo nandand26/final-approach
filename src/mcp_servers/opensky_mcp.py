@@ -122,7 +122,7 @@ def _get_oauth_bearer() -> str | None:
             "client_id": client_id,
             "client_secret": client_secret,
         },
-        timeout=15.0,
+        timeout=10.0,
     )
     response.raise_for_status()
     data = response.json()
@@ -145,7 +145,7 @@ def _opensky_basic_auth() -> tuple[str, str] | None:
     return None
 
 
-def _opensky_get(path: str, params: dict[str, Any] | None = None, *, timeout: float = 25.0) -> Any:
+def _opensky_get(path: str, params: dict[str, Any] | None = None, *, timeout: float = 10.0) -> Any:
     """GET OpenSky REST endpoint; raises requests errors for the caller to catch.
 
     Auth preference:

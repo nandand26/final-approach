@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,7 @@ from src.db.auth_db import (  # noqa: E402
     get_user_threads,
     init_auth_db,
     register_or_get_user,
+    user_owns_thread,
 )
 from src.graph.nodes import synthesizer_node  # noqa: E402
 from src.graph.workflow import app_graph  # noqa: E402
@@ -213,96 +215,205 @@ def _agent_steps_for_assistant_index(
 init_auth_db()    # users + user_threads ownership SQLite (auth only — not flight history)
 
 st.set_page_config(
-    page_title="Aviation Fleet & Operational Intelligence Agent",
+    page_title="FinalApproach",
     page_icon="✈️",
     layout="centered",
 )
-st.title("Aviation Fleet & Operational Intelligence Agent")
-st.caption("Google-authenticated, thread-isolated LangGraph aviation assistant.")
+
+# Light polish only (style-only st.html — never put CSS in st.markdown).
+st.html(
+    """
+<style>
+  div[data-testid="stAppViewContainer"] > .main .block-container {
+    max-width: 46rem;
+    padding-top: 1.1rem !important;
+  }
+</style>
+"""
+)
 
 # ---------------------------------------------------------------------------
 # Login gate — stop here if not signed in
 # ---------------------------------------------------------------------------
 if not st.user.is_logged_in:
-    st.markdown(
-        """
-### Welcome
-Sign in with Google to access your private aviation intelligence workspace.
-
-Each account gets isolated chat threads and memory checkpoints.
-"""
+    st.title("FinalApproach ✈️")
+    st.caption("Aviation Fleet & Operational Intelligence")
+    st.divider()
+    st.subheader("Welcome aboard")
+    st.write(
+        "Sign in with Google to open your FinalApproach chats — live airspace, "
+        "commercial status, and web research in one thread."
     )
-    st.button("Sign in with Google", on_click=st.login, type="primary")
+    st.caption("Each account keeps isolated threads and memory checkpoints.")
+    st.write("")
+    _l, _cta, _r = st.columns([1, 1.35, 1])
+    with _cta:
+        st.button(
+            "Sign in with Google",
+            on_click=st.login,
+            type="primary",
+            use_container_width=True,
+        )
     st.stop()
 
 # Save / update this Google user in our local auth DB
 current_user = register_or_get_user(_extract_authenticated_user())
 current_user_id = current_user["user_id"]
 
-# If a different Google account logs in on the same browser, drop old thread pointer
+_DRAFT_OPTION = "__draft__"
+
+
+def _start_draft_chat() -> None:
+    """Open a fresh in-memory chat UUID — not written to auth DB until first send."""
+    st.session_state.current_thread_id = str(uuid.uuid4())
+    st.session_state.thread_is_draft = True
+
+
+# Login / account switch → always land on a new unsaved chat (not last thread).
 if st.session_state.get("auth_user_id") != current_user_id:
     st.session_state.auth_user_id = current_user_id
-    st.session_state.current_thread_id = None
+    _start_draft_chat()
+elif "current_thread_id" not in st.session_state:
+    _start_draft_chat()
+elif "thread_is_draft" not in st.session_state:
+    # Legacy session pointer: treat unknown ids as draft until first persist.
+    tid = str(st.session_state.current_thread_id)
+    st.session_state.thread_is_draft = not user_owns_thread(current_user_id, tid)
 
 # ---------------------------------------------------------------------------
-# Sidebar = profile + list of THIS user's chats only
+# Sidebar = profile + list of THIS user's *saved* chats only
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.markdown("### FinalApproach ✈️")
+    st.caption("Ops workspace")
+    st.markdown("---")
     st.markdown("### User")
     st.markdown(f"**{current_user['display_name']}**")
     if current_user["email"]:
         st.caption(current_user["email"])
 
-    st.button("Log out", on_click=st.logout)
+    def _handle_logout() -> None:
+        # Clear session so the next Google login opens a fresh draft chat.
+        st.session_state.pop("auth_user_id", None)
+        st.session_state.pop("current_thread_id", None)
+        st.session_state.pop("thread_is_draft", None)
+        st.logout()
+
+    st.button("Log out", on_click=_handle_logout)
 
     st.markdown("---")
     st.markdown("### Chats")
 
-    # New Chat → new UUID thread_id row owned by this user
-    # (titles can all say "New Chat"; thread_id is what keeps them apart)
+    # New Chat → draft UUID only (DB row created on first Enter).
     if st.button("+ New Chat", type="primary"):
-        created = create_new_thread(user_id=current_user_id, title="New Chat")
-        st.session_state.current_thread_id = created["thread_id"]
+        _start_draft_chat()
         st.rerun()
 
     threads = get_user_threads(current_user_id)
-    if not threads:
-        # First visit: auto-make one empty chat so the page is usable
-        created = create_new_thread(user_id=current_user_id, title="New Chat")
-        st.session_state.current_thread_id = created["thread_id"]
-        st.rerun()
-
     thread_ids = [t["thread_id"] for t in threads]
     thread_labels = {
         t["thread_id"]: f"{t['title']} · {t['created_at'][:19].replace('T', ' ')}"
         for t in threads
     }
 
-    # If session points at a thread we don't own / that vanished, pick the newest
-    current_thread_id = st.session_state.get("current_thread_id")
-    if current_thread_id not in thread_ids:
-        current_thread_id = thread_ids[0]
-        st.session_state.current_thread_id = current_thread_id
+    is_draft = bool(st.session_state.get("thread_is_draft"))
+    current_thread_id = str(st.session_state.get("current_thread_id") or "")
 
-    selected_thread = st.selectbox(
-        "Select a thread",
-        options=thread_ids,
-        index=thread_ids.index(current_thread_id),
-        format_func=lambda tid: thread_labels.get(tid, tid),
-    )
-
-    # Switching chats = switching LangGraph memory namespace
-    if selected_thread != current_thread_id:
-        st.session_state.current_thread_id = selected_thread
-        st.rerun()
+    if is_draft:
+        st.caption("New chat — saved after your first message")
+        options = [_DRAFT_OPTION, *thread_ids]
+        thread_labels[_DRAFT_OPTION] = "New chat (unsaved)"
+        selected_thread = st.selectbox(
+            "Select a thread",
+            options=options,
+            index=0,
+            format_func=lambda tid: thread_labels.get(tid, tid),
+        )
+        if selected_thread != _DRAFT_OPTION:
+            st.session_state.current_thread_id = selected_thread
+            st.session_state.thread_is_draft = False
+            st.rerun()
+    elif thread_ids:
+        if current_thread_id not in thread_ids:
+            # Stale pointer — open a fresh draft instead of forcing an old chat.
+            _start_draft_chat()
+            st.rerun()
+        selected_thread = st.selectbox(
+            "Select a thread",
+            options=thread_ids,
+            index=thread_ids.index(current_thread_id),
+            format_func=lambda tid: thread_labels.get(tid, tid),
+        )
+        if selected_thread != current_thread_id:
+            st.session_state.current_thread_id = selected_thread
+            st.session_state.thread_is_draft = False
+            st.rerun()
+    else:
+        st.caption("No saved chats yet — ask something to create one.")
 
 active_thread_id = str(st.session_state.current_thread_id)
+thread_is_draft = bool(st.session_state.get("thread_is_draft"))
 
 # ---------------------------------------------------------------------------
 # Main chat history (from checkpointer for active_thread_id)
 # ---------------------------------------------------------------------------
-st.caption(f"Active thread: `{active_thread_id}`")
+# Chat hero — FinalApproach stays in the sidebar; main pane leads with the ask.
 history_messages = _load_thread_messages(active_thread_id)
+_chat_empty = not history_messages
+_settle_key = f"fa_input_settle_{active_thread_id}"
+
+# Peek whether this run is submitting the first message on an empty chat.
+# chat_input value is only known after the widget call; we stage CSS in two
+# phases (before widget + after) so empty chats center, then settle downward.
+_greeting_pad = "2.5rem 0 1.25rem 0" if _chat_empty else "0.25rem 0 0.85rem 0"
+_greeting_align = "center" if _chat_empty else "left"
+_greeting_sub = (
+    '<p style="margin:0.55rem 0 0 0;font-size:0.95rem;opacity:0.65;">'
+    "Ask about a flight, tail, route, or airspace target.</p>"
+    if _chat_empty
+    else ""
+)
+if _chat_empty:
+    # Lift the greeting toward mid-viewport so it sits with the centered input.
+    st.html('<div style="min-height: 18vh;"></div>')
+st.html(
+    f"""
+<div style="padding: {_greeting_pad}; text-align: {_greeting_align};">
+  <p style="
+    margin: 0;
+    font-size: 1.9rem;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    line-height: 1.25;
+  ">Hey, where we off to today?</p>
+  {_greeting_sub}
+</div>
+"""
+)
+
+# Base transition for the Streamlit chat-input dock (stBottom).
+st.html(
+    """
+<style>
+  div[data-testid="stBottom"] {
+    transition: transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: transform;
+  }
+</style>
+"""
+)
+# Empty chat (idle): hold the input in the vertical center under the greeting.
+if _chat_empty and not st.session_state.get(_settle_key):
+    st.html(
+        """
+<style>
+  div[data-testid="stBottom"] {
+    transform: translateY(-38vh);
+  }
+</style>
+"""
+    )
+
 total_assistants = sum(
     1
     for m in history_messages
@@ -325,7 +436,7 @@ for stored_message in history_messages:
             )
             assistant_turn_index += 1
             if snap:
-                with st.expander("Agent steps", expanded=False):
+                with st.expander("Sequential Plan", expanded=False):
                     render_agent_steps_panel(
                         strip=str(snap.get("strip") or ""),
                         strip_html=str(snap.get("strip_html") or "") or None,
@@ -338,7 +449,43 @@ for stored_message in history_messages:
 # New user prompt → run the agent for this thread
 # ---------------------------------------------------------------------------
 prompt = st.chat_input("Enter flight query or tail number...")
+
+# First message on a fresh chat: animate the dock from center → bottom.
+if _chat_empty and not prompt:
+    st.session_state[_settle_key] = False
+elif prompt and _chat_empty:
+    st.session_state[_settle_key] = True
+
+if st.session_state.get(_settle_key):
+    st.html(
+        """
+<style>
+  @keyframes faChatInputSettle {
+    from { transform: translateY(-38vh); }
+    to { transform: translateY(0); }
+  }
+  div[data-testid="stBottom"] {
+    transform: translateY(0) !important;
+    animation: faChatInputSettle 0.65s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+</style>
+"""
+    )
+
 if prompt:
+    # Persist draft → auth DB only when the user actually sends a message.
+    if thread_is_draft or not user_owns_thread(current_user_id, active_thread_id):
+        title = " ".join(prompt.strip().split())
+        if len(title) > 72:
+            title = title[:69].rstrip() + "…"
+        create_new_thread(
+            user_id=current_user_id,
+            title=title or "New Chat",
+            thread_id=active_thread_id,
+        )
+        st.session_state.thread_is_draft = False
+        thread_is_draft = False
+
     # Show the user bubble immediately
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -444,6 +591,8 @@ if prompt:
             # Keep metro board available (collapsed) after rerun, next to this answer
             _store_agent_steps(active_thread_id, progress)
             st.session_state.pop("live_metro_progress", None)
+            # Input already settled this turn — don't replay the slide on reload.
+            st.session_state[_settle_key] = False
 
             # Reload page from checkpointer so history is the source of truth.
             st.rerun()
@@ -512,6 +661,7 @@ if prompt:
                 _paint()
                 _store_agent_steps(active_thread_id, progress)
                 st.session_state.pop("live_metro_progress", None)
+                st.session_state[_settle_key] = False
                 st.rerun()
             except Exception as synth_exc:  # noqa: BLE001
                 placeholder.error(
