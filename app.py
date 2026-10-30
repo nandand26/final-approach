@@ -24,7 +24,8 @@ from typing import Any
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphInterrupt, GraphRecursionError
+from langgraph.types import Command
 
 # ---------------------------------------------------------------------------
 # Bootstrapping: path + env BEFORE importing our packages
@@ -96,13 +97,36 @@ def _thread_config(
         tags.append(f"user:{user_id}")
         metadata["user_id"] = user_id
     return {
-        # Up to 9 spoke hops (2+2+5) plus supervisor visits → keep headroom.
-        "recursion_limit": 22,
+        # Longest happy path is ~7 supersteps (discovery → interrupt →
+        # supervisor → parallel spokes → synthesizer). 10 cuts a hallucinated loop.
+        "recursion_limit": 10,
         "configurable": {"thread_id": thread_id},
         "run_name": "Aviation_Ops_Turn",
         "tags": tags,
         "metadata": metadata,
     }
+
+
+def _interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
+    """Read a paused clarification interrupt, if this thread is waiting on the user."""
+    interrupts = tuple(getattr(snapshot, "interrupts", None) or ())
+    if not interrupts:
+        return None
+    value = getattr(interrupts[0], "value", None)
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return None
+    return {"question": str(value), "options": []}
+
+
+def _format_interrupt_markdown(payload: dict[str, Any]) -> str:
+    question = str(payload.get("question") or "Which flight should I track?")
+    options = [str(item) for item in (payload.get("options") or []) if str(item).strip()]
+    if options and not any(opt in question for opt in options):
+        bullets = "\n".join(f"- `{opt}`" for opt in options)
+        return f"{question}\n\n{bullets}"
+    return question
 
 
 def _message_to_chat_row(message: Any) -> tuple[str, str] | None:
@@ -445,10 +469,28 @@ for stored_message in history_messages:
                         expanded=False,
                     )
 
+# Path 2 pause survives reruns via the checkpointer, not via messages.
+_pending_cfg = _thread_config(
+    active_thread_id,
+    user_id=current_user_id,
+    entrypoint="streamlit",
+)
+try:
+    _pending_interrupt = _interrupt_payload(app_graph.get_state(_pending_cfg))
+except Exception:  # noqa: BLE001
+    _pending_interrupt = None
+if _pending_interrupt:
+    with st.chat_message("assistant"):
+        st.markdown(_format_interrupt_markdown(_pending_interrupt))
+
 # ---------------------------------------------------------------------------
 # New user prompt → run the agent for this thread
 # ---------------------------------------------------------------------------
-prompt = st.chat_input("Enter flight query or tail number...")
+prompt = st.chat_input(
+    "Reply with a flight ident..."
+    if _pending_interrupt
+    else "Enter flight query or tail number..."
+)
 
 # First message on a fresh chat: animate the dock from center → bottom.
 if _chat_empty and not prompt:
@@ -490,35 +532,46 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Send ONLY the new message. Old history is already in the checkpointer
-    # for this thread_id. Also clear turn scratch so last question's plan
-    # and tool notes cannot leak into this question.
-    graph_input = {
-        "messages": [HumanMessage(content=prompt)],
-        # Stamp Google OAuth identity so Mem0 can scope cross-session memory.
-        "user_id": current_user_id,
-        "turn_notes": [],  # empty list = "clear scratch" (see merge_turn_notes)
-        "plan": [],        # empty list = wipe last turn's spoke queue
-        "next_worker": "",
-        "current_task": "",  # hop-local sub-query cleared each turn
-        # Memory Gate default OFF; supervisor may flip True for explicit prefs only.
-        "extract_memory": False,
-        "final_report": "",
-    }
+    thread_cfg = _thread_config(
+        active_thread_id,
+        user_id=current_user_id,
+        entrypoint="streamlit",
+    )
+    try:
+        resume_interrupt = _interrupt_payload(app_graph.get_state(thread_cfg))
+    except Exception:  # noqa: BLE001
+        resume_interrupt = None
+
+    # Fresh turn clears scratch. A clarification resume must NOT send a new
+    # graph_input — Command(resume=) continues the paused node.
+    graph_input: dict[str, Any] | Command
+    if resume_interrupt:
+        graph_input = Command(resume=prompt)
+    else:
+        graph_input = {
+            "messages": [HumanMessage(content=prompt)],
+            "user_id": current_user_id,
+            "turn_notes": [],  # empty list = "clear scratch" (see merge_turn_notes)
+            "plan": [],
+            "spokes_to_call": [],
+            "context_priority_order": [],
+            "intent": "",
+            "flight_number": None,
+            "search_query": None,
+            "next_worker": "",
+            "current_task": "",
+            "extract_memory": False,
+            "final_report": "",
+        }
 
     with st.chat_message("assistant"):
         # Live UI slot we redraw as the metro board advances
         placeholder = st.empty()
         # Keep raw notes in case recursion limit forces a manual synthesizer call
-        collected_turn_notes: list[str] = []
+        collected_turn_notes: list[dict] = []
         progress = TurnProgress()
         # Live track also mirrored in session_state so a mid-turn rerun can recover
         st.session_state["live_metro_progress"] = progress
-        thread_cfg = _thread_config(
-            active_thread_id,
-            user_id=current_user_id,
-            entrypoint="streamlit",
-        )
         # Mutable counter (list) — `if prompt:` is module scope, so `nonlocal` is illegal.
         logged_steps = [0]
 
@@ -544,14 +597,19 @@ if prompt:
                     stream_mode="updates",
                     config=thread_cfg,  # stamps thread_id so memory stays on this chat
                 ):
-                    # event looks like: {"spoke_2_liveops": {"turn_notes": [...]}}
+                    # event looks like: {"flightaware": {"turn_notes": [...]}}
                     for node_name, update in event.items():
                         if not isinstance(update, dict):
                             continue
 
-                        # Save scratch text for fallback; do NOT dump it raw in the UI
+                        # Save scratch notes for fallback; do NOT dump them raw in the UI
                         for note in update.get("turn_notes") or []:
-                            collected_turn_notes.append(str(note))
+                            if isinstance(note, dict):
+                                collected_turn_notes.append(note)
+                            else:
+                                collected_turn_notes.append(
+                                    {"spoke": str(node_name), "content": str(note)}
+                                )
 
                         # Move metro lights from this node update
                         advance_on_node_update(progress, str(node_name), update)
@@ -578,6 +636,19 @@ if prompt:
                             )
                         _paint()
 
+                held = _interrupt_payload(app_graph.get_state(thread_cfg))
+                if held:
+                    progress.final_report = _format_interrupt_markdown(held)
+                    _paint()
+                    status_box.update(
+                        label="Waiting for a flight ident",
+                        state="complete",
+                    )
+                    _flush_status_log(status_box)
+                    st.session_state.pop("live_metro_progress", None)
+                    st.session_state[_settle_key] = False
+                    st.rerun()
+
                 if not progress.final_report:
                     progress.final_report = "No response generated."
                     _paint()
@@ -597,6 +668,17 @@ if prompt:
             # Reload page from checkpointer so history is the source of truth.
             st.rerun()
 
+        except GraphInterrupt:
+            held = _interrupt_payload(app_graph.get_state(thread_cfg))
+            question = _format_interrupt_markdown(
+                held or {"question": "Which flight should I track?", "options": []}
+            )
+            progress.final_report = question
+            _paint()
+            st.session_state.pop("live_metro_progress", None)
+            st.session_state[_settle_key] = False
+            st.rerun()
+
         except GraphRecursionError as exc:
             # Agent hopped too many times — don't leave the user with a blank bubble.
             # Grey unfinished stations, then force a synthesizer pass on what we have.
@@ -605,7 +687,7 @@ if prompt:
                 "Synthesizing a partial aviation report from turn notes collected so far. "
                 f"({exc})"
             )
-            collected_turn_notes.append(closer)
+            collected_turn_notes.append({"spoke": "system", "content": closer})
             mark_remaining_skipped(progress)
             _paint()
 
@@ -619,11 +701,12 @@ if prompt:
 
             # Honor Memory Gate if supervisor already wrote it into the checkpoint.
             extract_memory_flag = False
+            priority_order: list[str] = []
             try:
                 snap = app_graph.get_state(thread_cfg)
-                extract_memory_flag = bool(
-                    (snap.values or {}).get("extract_memory")
-                )
+                values = snap.values or {}
+                extract_memory_flag = bool(values.get("extract_memory"))
+                priority_order = list(values.get("context_priority_order") or [])
             except Exception:  # noqa: BLE001
                 pass
 
@@ -632,6 +715,8 @@ if prompt:
                 "user_id": current_user_id,
                 "turn_notes": collected_turn_notes,
                 "plan": [],
+                "spokes_to_call": [],
+                "context_priority_order": priority_order,
                 "next_worker": "FINISH",
                 "current_task": "",
                 "extract_memory": extract_memory_flag,

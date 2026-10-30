@@ -26,7 +26,12 @@ NODE_DISPLAY_MAP = {
     "spoke_2_node": "🛫 Commercial Flight Engine",
     "spoke_3_node": "🔎 Web Research Engine",
     "synthesizer": "📋 Intelligence Synthesizer",
-    # Real LangGraph node / worker ids
+    # Fan-out node / worker ids
+    "opensky": "🛰️ Physical Airspace Radar Engine",
+    "flightaware": "🛫 Commercial Flight Engine",
+    "tavily": "🔎 Web Research Engine",
+    "clarification_node": "✋ Flight confirmation",
+    # Legacy aliases
     "spoke_1_opensky": "🛰️ Physical Airspace Radar Engine",
     "spoke_2_liveops": "🛫 Commercial Flight Engine",
     "spoke_3_websearch": "🔎 Web Research Engine",
@@ -36,7 +41,23 @@ NODE_DISPLAY_MAP = {
     "FINISH": "📋 Intelligence Synthesizer",
 }
 
+_WORKER_TO_FANOUT = {
+    "opensky": "opensky",
+    "flightaware": "flightaware",
+    "noaa": "flightaware",
+    "tavily": "tavily",
+    "Spoke_1_OpenSky": "opensky",
+    "Spoke_2_LiveOps": "flightaware",
+    "Spoke_3_WebSearch": "tavily",
+    "spoke_1_opensky": "opensky",
+    "spoke_2_liveops": "flightaware",
+    "spoke_3_websearch": "tavily",
+}
+
 _VALID_PLAN_WORKERS = {
+    "opensky",
+    "flightaware",
+    "tavily",
     "Spoke_1_OpenSky",
     "Spoke_2_LiveOps",
     "Spoke_3_WebSearch",
@@ -44,9 +65,12 @@ _VALID_PLAN_WORKERS = {
 
 # Stable station keys for each spoke worker (used when building plan-ordered tracks).
 _SPOKE_STATION_KEY = {
-    "Spoke_1_OpenSky": "spoke_1",
-    "Spoke_2_LiveOps": "spoke_2",
-    "Spoke_3_WebSearch": "spoke_3",
+    "opensky": "opensky",
+    "flightaware": "flightaware",
+    "tavily": "tavily",
+    "Spoke_1_OpenSky": "opensky",
+    "Spoke_2_LiveOps": "flightaware",
+    "Spoke_3_WebSearch": "tavily",
 }
 
 # Metro light icons (emoji fallback; HTML pills add color/pulse)
@@ -88,8 +112,26 @@ class TurnProgress:
     plan_workers: list[str] = field(default_factory=list)
 
 
+def _canonical_plan_worker(worker: str) -> str | None:
+    """Map any spoke alias to a fan-out id, or None if unknown."""
+    mapped = _WORKER_TO_FANOUT.get(str(worker or "").strip())
+    if mapped in {"opensky", "flightaware", "tavily"}:
+        return mapped
+    raw = str(worker or "").strip().lower()
+    if raw in {"opensky", "flightaware", "tavily"}:
+        return raw
+    return None
+
+
+def _coerce_note_text(note: Any) -> str:
+    """Plain text from a dict turn_note or a legacy string."""
+    if isinstance(note, dict):
+        return str(note.get("content") or "")
+    return str(note)
+
+
 def human_worker_label(worker: str) -> str:
-    """Turn Spoke_1_OpenSky into the friendly operational name."""
+    """Turn a fan-out id / legacy spoke name into the friendly operational name."""
     return NODE_DISPLAY_MAP.get(worker, worker.replace("_", " "))
 
 
@@ -99,15 +141,18 @@ def node_display_name(node_name: str) -> str:
 
 
 def _plan_worker_names(plan: list[Any]) -> list[str]:
-    """Normalize plan items (strings or {worker, task} dicts) to worker names."""
+    """Normalize plan items (strings or {worker, task} dicts) to fan-out ids."""
     names: list[str] = []
+    seen: set[str] = set()
     for item in plan or []:
         if isinstance(item, dict):
             worker = str(item.get("worker") or "").strip()
         else:
             worker = str(item or "").strip()
-        if worker in _VALID_PLAN_WORKERS:
-            names.append(worker)
+        canonical = _canonical_plan_worker(worker)
+        if canonical and canonical not in seen:
+            names.append(canonical)
+            seen.add(canonical)
     return names
 
 
@@ -163,37 +208,40 @@ def build_canonical_route(plan: list[Any]) -> list[Station]:
 def _plan_from_supervisor_update(update: dict[str, Any]) -> list[str] | None:
     """Rebuild full spoke order from the supervisor state write.
 
-    On first plan hop the graph pops the head into ``next_worker`` and leaves
-    the remainder in ``plan`` — so full order is ``[next_worker] + plan``.
+    Prefers ``spokes_to_call`` (parallel Send targets). Falls back to ``plan``.
     Returns ``None`` when this update is not a plan-generation write.
     """
+    if "spokes_to_call" in update:
+        return _plan_worker_names(update.get("spokes_to_call") or [])
+    plan = _plan_worker_names(update.get("plan") or [])
+    if plan:
+        return plan
     nxt = str(update.get("next_worker") or "").strip()
     if not nxt:
         return None
-    remaining = _plan_worker_names(update.get("plan") or [])
     if nxt == "FINISH":
-        # Empty-plan bypass (or already drained — caller only uses this
-        # before plan_built, so treat as chat-only → synthesizer).
         return []
-    if nxt in _VALID_PLAN_WORKERS:
-        return [nxt] + remaining
+    mapped = _canonical_plan_worker(nxt)
+    if mapped:
+        return [mapped]
     return None
 
 
-def parse_plan_workers_from_note(note: str) -> list[str] | None:
-    """Read the planned spokes out of a supervisor turn_note string.
+def parse_plan_workers_from_note(note: Any) -> list[str] | None:
+    """Read the planned spokes out of a supervisor turn_note.
 
     Returns:
       - list of spoke names, or [] for empty plan / chat only
       - None if this note is not a plan-generation note (e.g. a later hop)
     """
+    text = _coerce_note_text(note)
     match = re.search(
         r"Plan generated[^:]*:\s*(\[[^\]]*\])",
-        note,
+        text,
         flags=re.IGNORECASE,
     )
     if not match:
-        if "Empty plan" in note or "conversational/direct bypass" in note:
+        if "Empty plan" in text or "conversational/direct bypass" in text:
             return []
         return None
 
@@ -208,16 +256,12 @@ def parse_plan_workers_from_note(note: str) -> list[str] | None:
 
     if not workers:
         found = re.findall(
-            r"Spoke_[123]_(?:OpenSky|LiveOps|WebSearch)",
+            r"opensky|flightaware|tavily|Spoke_[123]_(?:OpenSky|LiveOps|WebSearch)",
             raw_list,
         )
-        seen: set[str] = set()
-        for w in found:
-            if w in _VALID_PLAN_WORKERS and w not in seen:
-                workers.append(w)
-                seen.add(w)
+        workers = _plan_worker_names(found)
 
-    return [w for w in workers if w in _VALID_PLAN_WORKERS]
+    return workers
 
 
 # ---------------------------------------------------------------------------
@@ -675,8 +719,8 @@ def format_supervisor_card(note: str, plan: list[str] | None) -> str:
         if not plan:
             return "No tools needed — routing straight to the Intelligence Synthesizer."
         labels = [human_worker_label(w) for w in plan]
-        return "**Plan:** " + " → ".join(labels)
-    clean = re.sub(r"^\[supervisor\]\s*", "", note).strip()
+        return "**Plan:** " + " · ".join(labels)
+    clean = re.sub(r"^\[supervisor\]\s*", "", _coerce_note_text(note)).strip()
     return _trim(clean, 240)
 
 
@@ -798,23 +842,22 @@ def _station_by_kind(progress: TurnProgress, kind: str) -> Station | None:
 
 
 def _activate_next_from_plan(progress: TurnProgress) -> None:
-    """Light the next planned spoke that is still pending, else the synthesizer.
-
-    If a station is already active (e.g. spoke just activated after completion,
-    and supervisor emits a later hop), leave the train where it is.
-    """
-    if any(s.status == "active" for s in progress.stations):
-        active = next(s for s in progress.stations if s.status == "active")
-        progress.status_line = f"Now: {active.label}"
+    """Light ALL pending planned spokes (parallel fan-out), else the synthesizer."""
+    if any(s.kind == "spoke" and s.status == "active" for s in progress.stations):
+        active = [s for s in progress.stations if s.status == "active"]
+        progress.status_line = "Now: " + " · ".join(s.label for s in active)
         return
 
-    for worker in progress.plan_workers:
-        station = _station_by_worker(progress, worker)
-        if station and station.status == "pending":
+    pending_spokes = [
+        s for s in progress.stations if s.kind == "spoke" and s.status == "pending"
+    ]
+    if pending_spokes:
+        for station in pending_spokes:
             station.status = "active"
-            progress.status_line = f"Now: {station.label}"
             _log(progress, f"In progress: {station.label}")
-            return
+        progress.status_line = "Now: " + " · ".join(s.label for s in pending_spokes)
+        return
+
     finish = _station_by_kind(progress, "finish")
     if finish and finish.status == "pending":
         finish.status = "active"
@@ -826,7 +869,7 @@ def _activate_next_from_plan(progress: TurnProgress) -> None:
 
 def advance_on_node_update(progress: TurnProgress, node_name: str, update: dict[str, Any]) -> None:
     """Handle one streamed update from app_graph.stream(...)."""
-    notes = [str(n) for n in (update.get("turn_notes") or [])]
+    notes = [_coerce_note_text(n) for n in (update.get("turn_notes") or [])]
 
     if update.get("final_report"):
         progress.final_report = str(update["final_report"])
@@ -856,11 +899,11 @@ def advance_on_node_update(progress: TurnProgress, node_name: str, update: dict[
                 router.status = "done"
                 router.detail_md = format_supervisor_card(str(plan_note), plan)
                 if plan:
-                    router.summary = " → ".join(human_worker_label(w) for w in plan)
+                    router.summary = " · ".join(human_worker_label(w) for w in plan)
                     _log(
                         progress,
-                        f"{NODE_DISPLAY_MAP['supervisor']}: routing to "
-                        + " → ".join(human_worker_label(w) for w in plan),
+                        f"{NODE_DISPLAY_MAP['supervisor']}: fan-out "
+                        + " · ".join(human_worker_label(w) for w in plan),
                     )
                 else:
                     router.summary = "Direct to synthesizer"
@@ -890,16 +933,21 @@ def advance_on_node_update(progress: TurnProgress, node_name: str, update: dict[
         _activate_next_from_plan(progress)
         return
 
-    if node_name == "spoke_1_opensky":
-        _complete_spoke(progress, "Spoke_1_OpenSky", notes)
+    if node_name in {"opensky", "spoke_1_opensky"}:
+        _complete_spoke(progress, "opensky", notes)
         return
 
-    if node_name == "spoke_2_liveops":
-        _complete_spoke(progress, "Spoke_2_LiveOps", notes)
+    if node_name in {"flightaware", "spoke_2_liveops"}:
+        _complete_spoke(progress, "flightaware", notes)
         return
 
-    if node_name == "spoke_3_websearch":
-        _complete_spoke(progress, "Spoke_3_WebSearch", notes)
+    if node_name in {"tavily", "spoke_3_websearch"}:
+        _complete_spoke(progress, "tavily", notes)
+        return
+
+    if node_name == "clarification_node":
+        _log(progress, "Waiting for a flight ident before live tracking.")
+        progress.status_line = "Waiting for a flight ident"
         return
 
     if node_name == "synthesizer":
@@ -927,7 +975,7 @@ def _complete_spoke(progress: TurnProgress, worker: str, notes: list[str]) -> No
         _activate_next_from_plan(progress)
         return
 
-    if worker == "Spoke_1_OpenSky":
+    if worker in {"opensky", "Spoke_1_OpenSky"}:
         detail = format_spoke1_card(joined)
         metrics = extract_spoke1_metrics(joined)
         payload = _first_dict_blob(joined)
@@ -944,7 +992,7 @@ def _complete_spoke(progress: TurnProgress, worker: str, notes: list[str]) -> No
             progress,
             f"{station.label}: {'⚠️ ' if warn else ''}{station.summary}",
         )
-    elif worker == "Spoke_3_WebSearch":
+    elif worker in {"tavily", "Spoke_3_WebSearch"}:
         detail = format_spoke3_card(joined)
         payload = _first_dict_blob(joined)
         warn = _looks_like_api_error(payload, joined) or (
@@ -1099,7 +1147,9 @@ def render_progress(progress: TurnProgress) -> None:
     strip_html = metro_strip_html(progress.stations)
 
     # Live Spoke 1 metrics while that station just completed / is showing
-    spoke1 = _station_by_worker(progress, "Spoke_1_OpenSky")
+    spoke1 = _station_by_worker(progress, "opensky") or _station_by_worker(
+        progress, "Spoke_1_OpenSky"
+    )
     show_live_metrics = bool(
         spoke1
         and spoke1.metrics

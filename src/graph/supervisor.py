@@ -1,13 +1,17 @@
 """Supervisor routing lives in `src/graph/nodes.py` (`supervisor_node`).
 
-Domain split (Plan-and-Execute):
-  - Spoke_1_OpenSky → physical ADS-B / OpenSky MCP tools
-  - Spoke_2_LiveOps → commercial FlightAware + NOAA + Tavily
-  - FINISH → synthesizer
+Three paths (`SupervisorPlan.intent`):
+  - telemetry_known → parallel Send(flightaware, opensky[, tavily])
+  - telemetry_discovery → tavily, then clarification_node interrupt,
+    Command(goto="supervisor") after the user picks an ident
+  - general_knowledge → tavily or synthesizer (no flightaware / opensky)
+  - direct_chat → synthesizer
 
-This module exists as a pointer for docs/reviewers; import the node from nodes.py.
+NOAA METARs stay inside FlightAware (delay/hold/divert only).
+Pydantic schema: `SupervisorPlan` in `src/graph/models.py`.
 """
 
-from src.graph.nodes import supervisor_node
+from src.graph.models import SupervisorPlan
+from src.graph.nodes import clarification_node, supervisor_node
 
-__all__ = ["supervisor_node"]
+__all__ = ["supervisor_node", "clarification_node", "SupervisorPlan"]

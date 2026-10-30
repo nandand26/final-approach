@@ -1,49 +1,58 @@
-"""LangGraph StateGraph supervisor workflow with Plan-and-Execute delegation.
+"""LangGraph router.
 
-The supervisor builds a turn-local `plan` queue once per user message, then
-pops spokes sequentially. Spokes always return to the supervisor so remaining
-plan steps can run. Empty plan / FINISH routes to the synthesizer.
+Path 1 (telemetry_known): Send() the spokes the supervisor chose, in parallel.
+Path 2 (telemetry_discovery): tavily → clarification_node interrupt →
+Command(goto="supervisor"). No static edge off clarification_node.
+Path 3a (general_knowledge): tavily, then synthesizer.
+Path 3b (direct_chat): synthesizer. No tools.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Literal
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
+from langgraph.types import Send
 
 from src.graph.nodes import (
+    clarification_node,
     spoke_1_opensky_node,
     spoke_2_liveops_node,
     spoke_3_websearch_node,
     supervisor_node,
     synthesizer_node,
 )
-from src.graph.state import AgentState
+from src.graph.state import VALID_FANOUT_SPOKES, AgentState
 
 # Project root: src/graph/workflow.py -> src -> aviation_agent/
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINT_DB_PATH = _PROJECT_ROOT / "checkpoints.db"
 
 
-def _route_supervisor(
-    state: AgentState,
-) -> Literal[
-    "spoke_1_opensky",
-    "spoke_2_liveops",
-    "spoke_3_websearch",
-    "synthesizer",
-]:
-    """Map supervisor's next_worker choice to an actual graph node name."""
-    nxt = state.get("next_worker", "FINISH")
-    if nxt == "Spoke_1_OpenSky":
-        return "spoke_1_opensky"
-    if nxt == "Spoke_2_LiveOps":
-        return "spoke_2_liveops"
-    if nxt == "Spoke_3_WebSearch":
-        return "spoke_3_websearch"
+def _route_after_supervisor(state: AgentState):
+    """Intent → one node, a Send list, or the synthesizer."""
+    intent = str(state.get("intent") or "")
+    spokes = [
+        spoke
+        for spoke in list(state.get("spokes_to_call") or [])
+        if spoke in VALID_FANOUT_SPOKES
+    ]
+    if intent == "telemetry_discovery":
+        return "tavily"
+    if intent == "general_knowledge":
+        return "tavily"
+    if intent == "direct_chat" or not spokes:
+        return "synthesizer"
+    # telemetry_known: every spoke the supervisor selected, in one parallel step.
+    return [Send(spoke, state) for spoke in spokes]
+
+
+def _route_after_tavily(state: AgentState) -> str:
+    """Discovery pauses for a human ident. Every other Tavily hop synthesizes."""
+    if str(state.get("intent") or "") == "telemetry_discovery":
+        return "clarification_node"
     return "synthesizer"
 
 
@@ -52,7 +61,7 @@ def _build_sqlite_checkpointer() -> SqliteSaver:
 
     check_same_thread=False is required: Streamlit/LangGraph may touch the
     connection from more than one thread. SqliteSaver serializes access with
-    an internal lock.
+    an internal lock. Required for interrupt()/resume.
     """
     conn = sqlite3.connect(
         str(CHECKPOINT_DB_PATH),
@@ -66,27 +75,41 @@ def _build_sqlite_checkpointer() -> SqliteSaver:
 workflow = StateGraph(AgentState)
 
 workflow.add_node("supervisor", supervisor_node)
-workflow.add_node("spoke_1_opensky", spoke_1_opensky_node)
-workflow.add_node("spoke_2_liveops", spoke_2_liveops_node)
-workflow.add_node("spoke_3_websearch", spoke_3_websearch_node)
+workflow.add_node("opensky", spoke_1_opensky_node)
+workflow.add_node("flightaware", spoke_2_liveops_node)
+workflow.add_node("tavily", spoke_3_websearch_node)
+# destinations= declares the Command(goto=) target only. No static edge,
+# so this node does not also fall through to END.
+workflow.add_node(
+    "clarification_node",
+    clarification_node,
+    destinations=("supervisor",),
+)
 workflow.add_node("synthesizer", synthesizer_node)
 
 workflow.set_entry_point("supervisor")
 
 workflow.add_conditional_edges(
     "supervisor",
-    _route_supervisor,
-    {
-        "spoke_1_opensky": "spoke_1_opensky",
-        "spoke_2_liveops": "spoke_2_liveops",
-        "spoke_3_websearch": "spoke_3_websearch",
-        "synthesizer": "synthesizer",
-    },
+    _route_after_supervisor,
+    [
+        "opensky",
+        "flightaware",
+        "tavily",
+        "synthesizer",
+    ],
 )
 
-workflow.add_edge("spoke_1_opensky", "supervisor")
-workflow.add_edge("spoke_2_liveops", "supervisor")
-workflow.add_edge("spoke_3_websearch", "supervisor")
+# Discovery vs research. clarification_node has NO static edge — it returns
+# Command(goto="supervisor") only.
+workflow.add_conditional_edges(
+    "tavily",
+    _route_after_tavily,
+    ["clarification_node", "synthesizer"],
+)
+
+workflow.add_edge("opensky", "synthesizer")
+workflow.add_edge("flightaware", "synthesizer")
 workflow.add_edge("synthesizer", END)
 
 # On-disk SQLite checkpointer: each thread_id keeps isolated chat memory

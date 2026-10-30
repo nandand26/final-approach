@@ -6,10 +6,10 @@ It answers operational questions by combining:
 
 | Source | Role |
 |--------|------|
-| OpenSky Network (Spoke 1 / FastMCP) | Live ADS-B vectors, airport movements, tracks (keyed by **icao24** hex) |
-| FlightAware AeroAPI | Live / near-live commercial flight status, aircraft, codeshares (Spoke 2) |
-| NOAA Aviation Weather Center METARs | Conditional weather on delay / hold / divert (Spoke 2) |
-| Tavily web search | Unstructured aviation research / route discovery (Spoke 3) |
+| OpenSky Network (`opensky` / FastMCP) | Live ADS-B vectors, airport movements, tracks (keyed by **icao24** hex) |
+| FlightAware AeroAPI (`flightaware`) | Live / near-live commercial flight status, aircraft, codeshares |
+| NOAA Aviation Weather Center METARs | Conditional weather on delay / hold / divert (**inside** FlightAware, not a spoke) |
+| Tavily web search (`tavily`) | Unstructured aviation research / route discovery / NOTAMs |
 | Auth SQLite (`auth_sessions.db`) | Google user → owned chat `thread_id`s only |
 | LangGraph `SqliteSaver` (`checkpoints.db`) | Durable chat transcript + graph state per `thread_id` |
 | Mem0 (`mem0ai`) | Cross-session user preferences / facts scoped by Google `user_id` |
@@ -29,7 +29,7 @@ Access is gated by **Google OAuth**. Each user owns isolated **chat threads**; L
 2. [Frontend ↔ backend connection](#2-frontend--backend-connection-streamlit--langgraph)
 3. [Authentication & multi-tenant isolation](#3-authentication--multi-tenant-isolation)
 4. [Agent state (`AgentState`)](#4-agent-state-agentstate)
-5. [LangGraph topology & Plan-and-Execute](#5-langgraph-topology--plan-and-execute)
+5. [LangGraph topology & parallel fan-out](#5-langgraph-topology--parallel-fan-out)
 6. [Node responsibilities](#6-node-responsibilities)
 7. [Spoke 1 — OpenSky Physical Airspace](#7-spoke-1--opensky-physical-airspace)
 8. [Spoke 2 & Spoke 3 tools](#8-spoke-2--spoke-3-tools-flightaware-noaa-tavily)
@@ -53,21 +53,23 @@ A logged-in user opens a chat thread and asks something like “What’s the sta
 
 1. Streamlit authenticates the user and selects an owned `thread_id`.
 2. The prompt is sent into a LangGraph `StateGraph` with that `thread_id` in config **and** the Google `user_id` in graph state.
-3. A **supervisor** retrieves up to 3 Mem0 facts for that `user_id`, then builds a short **plan** of `{worker, task}` steps once per turn.
-4. **Spokes** run tools for the popped `current_task` and write scratch into `turn_notes`.
-5. Spokes return to the supervisor until the plan is drained.
-6. A **synthesizer** turns scratch + recent chat into the final assistant message (and stamps a durable OpenSky vector block when live states exist), then **`memory.add`s** the user/assistant turn into Mem0.
+3. A **supervisor** retrieves up to 3 Mem0 facts for that `user_id`, then chooses `spokes_to_call` (parallel `Send` targets) and `context_priority_order` (how the synthesizer packs notes).
+4. Selected **spokes** run **concurrently** (LangGraph `Send` fan-out). Each writes `{spoke, content}` into `turn_notes`.
+5. All spoke hops **fan in** to the synthesizer (they do not return to the supervisor).
+6. The **synthesizer** sanitizes/reorders notes, writes one assistant message (plus a durable OpenSky vector block when live states exist), then **`memory.add`s** the turn into Mem0 only if the Memory Gate is open.
 7. Streamlit streams metro progress live (`st.status` + station board), then reloads durable history from the checkpointer.
 
 ### Domain split (important)
 
-| Spoke | Handles | Does **not** handle |
-|-------|---------|---------------------|
-| **Spoke 1 — OpenSky** | `icao24`, altitude / GS / VS, trajectories, ADS-B airport arrivals/departures | Marketed flight numbers (BA117, AI8303), schedules, web research |
-| **Spoke 2 — Live ops** | Flight numbers / tails, FlightAware status, codeshares, METAR-on-anomaly | Tavily / web research; pure physical radar without a commercial ident |
-| **Spoke 3 — Web search** | Tavily research, schedules, airline/route → flight-number discovery, transit | FlightAware live status, OpenSky ADS-B |
+| Spoke id | Handles | Does **not** handle |
+|----------|---------|---------------------|
+| **`opensky`** | `icao24`, altitude / GS / VS, trajectories, ADS-B airport arrivals/departures | Marketed flight numbers (BA117, AI8303), schedules, web research |
+| **`flightaware`** | Flight numbers / tails, FlightAware status, codeshares, METAR-on-anomaly | Tavily / web research; pure physical radar without a commercial ident |
+| **`tavily`** | Tavily research, schedules, airline/route → flight-number discovery, transit, NOTAMs | FlightAware live status, OpenSky ADS-B |
 
-Airline/route asks **without** a flight number (e.g. “Batik Air from India to KL”) typically schedule **Spoke 3 then Spoke 2**. Hybrid asks (BA117 **and** icao24 `4cc2a3`) may schedule OpenSky + LiveOps. The synthesizer is prompted to say when commercial ↔ ADS-B identities **cannot be joined**.
+NOAA is **not** a fourth spoke. `_enrich_formatted_with_noaa` runs inside `flightaware_live_status` only when AeroAPI reports delay / hold / divert.
+
+Airline/route asks **without** a flight number (e.g. “Batik Air from KL to BLR”) schedule **`tavily` and `flightaware` in parallel**. That is a known gap vs the old sequential hop — see [§16](#16-current-limitations). Hybrid asks (BA117 **and** icao24 `4cc2a3`) may fan out OpenSky + FlightAware together. The synthesizer is prompted to say when commercial ↔ ADS-B identities **cannot be joined**.
 
 ### Runtime layers
 
@@ -85,7 +87,7 @@ Airline/route asks **without** a flight number (e.g. “Batik Air from India to 
                             │ config.configurable.thread_id
 ┌───────────────────────────▼─────────────────────────────────┐
 │  LangGraph StateGraph (workflow.py)                         │
-│  supervisor ⇄ spokes → synthesizer → END                    │
+│  supervisor ─Send()─► spokes (parallel) ─► synthesizer → END│
 │  checkpointer: SqliteSaver → checkpoints.db (by thread_id)  │
 │  Mem0: search @ supervisor, add @ synthesizer (by user_id)  │
 │  LangSmith: run_name/tags on stream + @traceable tools      │
@@ -93,9 +95,9 @@ Airline/route asks **without** a flight number (e.g. “Batik Air from India to 
                             │
         ┌───────────────────┼───────────────────┬───────────────────┐
         ▼                   ▼                   ▼                   ▼
-  Spoke 1 OpenSky     Spoke 2 LiveOps     Spoke 3 WebSearch   Synthesizer
-  (Gemini → tool      (FA + NOAA;         (Tavily; optional   (Gemini +
-   plan → MCP)         no Tavily)          Gemini refine)      OpenSky stamp + Mem0)
+  opensky             flightaware         tavily              Synthesizer
+  (Gemini → tool      (FA + NOAA-on-      (Tavily;            (reorder notes
+   plan → MCP)         delay; no Tavily)   0-LLM fast path)    + Gemini + Mem0)
 ```
 
 ---
@@ -145,15 +147,20 @@ graph_input = {
     "messages": [HumanMessage(content=prompt)],  # only the NEW message
     "user_id": current_user_id,  # Google OAuth identity for Mem0 scoping
     "turn_notes": [],   # explicit reset → merge_turn_notes clears scratch
-    "plan": [],         # explicit reset → prior turn queue cannot leak
+    "plan": [],         # filled by the supervisor: one {worker, task} per spoke
+    "spokes_to_call": [],
+    "context_priority_order": [],
+    "intent": "",
+    "flight_number": None,
+    "search_query": None,
     "next_worker": "",
-    "current_task": "", # hop-local sub-query cleared each turn
+    "current_task": "",
     "extract_memory": False,  # Memory Gate OFF until supervisor decides
     "final_report": "",
 }
 ```
 
-3. Build `thread_cfg = _thread_config(active_thread_id, user_id=..., entrypoint="streamlit")` — stamps `thread_id`, `recursion_limit=22`, and LangSmith `run_name` / `tags` / `metadata`.
+3. Build `thread_cfg = _thread_config(active_thread_id, user_id=..., entrypoint="streamlit")` — stamps `thread_id`, `recursion_limit=10`, and LangSmith `run_name` / `tags` / `metadata`.
 4. Stream inside `st.status("Orchestrating Flight Intelligence Pipeline...")`:
 
 ```python
@@ -184,7 +191,7 @@ app_graph.stream(
 
 ### Recursion-limit fallback
 
-Plan-and-Execute can hop supervisor ↔ spokes several times. `recursion_limit` is **22** (headroom for up to 2+2+5 spoke runs plus supervisor visits). If LangGraph still aborts:
+The longest happy path is discovery → interrupt → supervisor → parallel spokes → synthesizer. `recursion_limit` is **10**. If LangGraph still aborts:
 
 1. Append a system closer into collected turn notes.
 2. Call `synthesizer_node(partial_state)` **directly**.
@@ -224,10 +231,15 @@ Defined in `src/graph/state.py`.
 |-------|---------------------------|----------|---------|
 | `messages` | `add_messages_window` (append, trim to last **10**) | Durable per `thread_id` | User + final assistant answers |
 | `user_id` | Replace | Stamped each turn from auth | Google identity for Mem0 (not chat text) |
-| `turn_notes` | `merge_turn_notes` (`[]` clears; else append) | Turn-local | Supervisor + spoke scratch |
-| `plan` | Replace | Turn-local | Ordered `{"worker","task"}` steps still left to run |
-| `next_worker` | Replace | Hop-local | `Spoke_1_OpenSky` \| `Spoke_2_LiveOps` \| `Spoke_3_WebSearch` \| `FINISH` |
-| `current_task` | Replace | Hop-local | Sub-query for the active spoke (from plan head `task`) |
+| `turn_notes` | `merge_turn_notes` (`[]` clears; else `operator.add`) | Turn-local | List of `{spoke, content}` dicts (parallel spokes append) |
+| `plan` | Replace | Turn-local | One `{"worker","task"}` per id in `spokes_to_call`. Empty only for `direct_chat` |
+| `intent` | Replace | Turn-local | `telemetry_known` \| `telemetry_discovery` \| `general_knowledge` \| `direct_chat` |
+| `flight_number` | Replace | Turn-local | Marketed ident (`BA117`) once the user typed or picked one. Otherwise `None` |
+| `search_query` | Replace | Turn-local | Tavily query for discovery or research. `None` when no web search is needed |
+| `spokes_to_call` | Replace | Turn-local | Fan-out targets: `opensky` \| `flightaware` \| `tavily` |
+| `context_priority_order` | Replace | Turn-local | Synthesizer pack order. One slot per spoke; all of that spoke's notes are grouped there |
+| `next_worker` | Replace | Hop-local | First spoke id or `FINISH` (metro / bypass) |
+| `current_task` | Replace | Hop-local | Default sub-query; each spoke prefers its own `plan` task |
 | `extract_memory` | Replace | Turn-local (reset `False` each prompt) | Memory Gate: supervisor True → synthesizer may `memory.add` |
 | `final_report` | Replace | Turn result | Synthesizer answer string |
 
@@ -239,27 +251,32 @@ With a checkpointer, naive “append forever” scratch would leak prior-turn to
 
 ### What is *not* top-level state
 
-`flight_ident`, OpenSky args, `weather_context`, etc. live inside spoke JSON embedded in `turn_notes` (and durable OpenSky fields are also stamped into the final `messages` text). Exact tool args are extracted **inside spokes** from `current_task` / messages / notes — the supervisor only queues intent.
+OpenSky args, `weather_context`, and the resolved ident string inside a tool payload live in spoke JSON embedded in `turn_notes` (durable OpenSky fields are also stamped into the final `messages` text). `flight_number` and `search_query` are top-level fields. Each spoke reads its instruction from its own `plan` task, then `current_task`, then the latest user message.
 
-Constants: `MESSAGE_WINDOW = 10`, `SPOKE_CAPS = {Spoke_1: 2, Spoke_2: 2, Spoke_3: 5}`.
+Constants: `MESSAGE_WINDOW = 10`, `VALID_FANOUT_SPOKES = (opensky, flightaware, tavily)`, `SPOKE_CAPS = 2` each. Fan-out still Sends each spoke once per turn. The cap is the ceiling if a plan lists the same worker more than once. The supervisor and the synthesizer both read all 10 stored messages, with no per-message character cut.
 
 ---
 
-## 5) LangGraph topology & Plan-and-Execute
+## 5) LangGraph topology & parallel fan-out
 
 ### Graph wiring (`src/graph/workflow.py`)
 
 ```text
 ENTRY → supervisor
           │
-          ├─(Spoke_1_OpenSky)→ spoke_1_opensky ──┐
-          ├─(Spoke_2_LiveOps)→ spoke_2_liveops ──┤
-          ├─(Spoke_3_WebSearch)→ spoke_3_websearch┤
-          └─(FINISH / other)→ synthesizer → END  │
-                                                 │
-                     ◄───────────────────────────┘
-                     (spokes always return to supervisor)
+          ├─ intent=telemetry_known
+          │     Send(each spoke the supervisor chose) ──► synthesizer → END
+          │
+          ├─ intent=telemetry_discovery
+          │     tavily → clarification_node  (interrupt)
+          │                 │  user picks ident
+          │                 └── Command(goto="supervisor")   # no static edge
+          │
+          ├─ intent=general_knowledge → tavily → synthesizer → END
+          └─ intent=direct_chat → synthesizer → END
 ```
+
+Path 1 spokes run **at the same time**. The supervisor chooses which of OpenSky, FlightAware, and Tavily are in that set. LangGraph waits for every `Send` branch, then merges `turn_notes` before the synthesizer. Path 2 is Tavily, then the human picks an ident. It does **not** call FlightAware or OpenSky on that hop.
 
 ```python
 # workflow.py — durable on-disk checkpointer (survives Streamlit restarts)
@@ -267,25 +284,27 @@ app_graph = workflow.compile(checkpointer=_build_sqlite_checkpointer())
 # → SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=False))
 ```
 
-### Plan-and-Execute lifecycle (one user message)
+### Fan-out / fan-in lifecycle (one user message)
 
-**Phase A — turn start** (`turn_notes` empty after app reset):
+1. Supervisor runs Mem0 `search(...)` (soft-fail if unavailable).
+2. Supervisor LLM (or heuristic) returns `SupervisorPlan`:
+   - `intent` — `telemetry_known` | `telemetry_discovery` | `general_knowledge` | `direct_chat`
+   - `flight_number` / `search_query`
+   - `spokes_to_call` — Send targets, or `[tavily]` for discovery / research
+   - `plan` — exactly one `{worker, task}` for every id in `spokes_to_call`. A mismatch is rejected
+   - `context_priority_order` — synthesizer pack order. Missing or invalid lists fall back to FlightAware, then Tavily, then OpenSky
+   - Memory Gate `extract_memory`
+3. A known ident keeps the supervisor's spoke list and those spokes run in parallel. An unknown ident and general research are forced to Tavily only. A greeting is forced to no spokes. Unknown spoke names are dropped. A keyword plan runs only when the supervisor model is unavailable.
+4. `_route_after_supervisor` returns a node name or `[Send(spoke, state) for spoke in spokes]` for Path 1.
+5. Discovery: Tavily writes candidates into `turn_notes` only, then `clarification_node` calls `interrupt(...)`. Streamlit resumes with `Command(resume=user_text)`. The node appends that text as a `HumanMessage`, clears `turn_notes`, and `Command(goto="supervisor")`. There is **no static edge** off `clarification_node`.
+6. Second supervisor pass sees the ident and takes Path 1.
+7. Synthesizer sanitizes pack order, sorts notes, appends any spoke that returned data but was missing from the list.
 
-1. Supervisor runs Mem0 `search(query=latest_prompt, user_id=..., limit=3)` (soft-fail if Mem0 unavailable).
-2. Supervisor LLM (or heuristic fallback) builds ordered `plan: list[{worker, task}]` **and** Memory Gate `extract_memory`.
-3. Caps from `SPOKE_CAPS` (OpenSky 2 / LiveOps 2 / WebSearch 5); invalid workers dropped.
-4. Empty plan → conversational bypass → `FINISH` (`current_task=""`).
-5. Non-empty → pop head into `next_worker` + `current_task`, keep remainder in `plan`.
+`recursion_limit` is **10**. Discovery JSON stays in `turn_notes`, not in durable `messages`.
 
-**Phase B — drain queue:**
+### Discovery handoff (Path 2)
 
-1. Spoke runs using `current_task` → `[Spoke_X_...]` into `turn_notes` → back to supervisor.
-2. Re-sanitize remaining plan against execution counts.
-3. Empty / cap → `FINISH` → synthesizer.
-
-This is **not** unbounded ReAct. Short queue + hard caps = predictable cost/latency for demos.
-
-**Supervisor passes intent, not tool kwargs.** It sets `next_worker` + `current_task`. Spokes extract concrete tool args (FlightAware ident, OpenSky tool plan, Tavily query) themselves.
+“Status of Batik Air from KL to BLR” calls Tavily, then pauses for a human ident. After the reply, the supervisor runs again as a known-ident turn and chooses which spokes run in parallel. OpenSky still soft-fails without an `icao24` hex. There is no registration-to-icao24 map.
 
 ---
 
@@ -294,44 +313,45 @@ This is **not** unbounded ReAct. Short queue + hard caps = predictable cost/late
 ### Supervisor (`supervisor_node`)
 
 - **LLM:** OpenAI `supervisor_llm` (`SUPERVISOR_MODEL`, default `gpt-4o-mini`).
-- **Mem0 (turn start):** `_search_user_memories` → up to 3 facts injected into the planner system prompt (units, formatting prefs, etc.) and briefly mirrored in `turn_notes`.
-- **Structured output:** `SupervisorPlan { plan: list[PlannedStep], extract_memory: bool }` where each `PlannedStep` is `{worker, task}`.
-- **Memory Gate:** `extract_memory=true` only for explicit durable prefs (“always use meters…”); `false` for BA117 / ADS-B / weather / filler.
+- **Mem0 (turn start):** `_search_user_memories` → up to 3 facts injected into the planner system prompt.
+- **Structured output:** `SupervisorPlan { intent, flight_number, search_query, spokes_to_call, plan, context_priority_order, extract_memory }`. `plan` is required: one `{worker, task}` per selected spoke, no extras, no blank tasks. Empty only when `spokes_to_call` is empty.
+- **Safety pack order:** if `flightaware` (may carry NOAA weather on delay) and/or `tavily` (NOTAMs) are selected, they must sit at the **start or end** of `context_priority_order` (lost-in-the-middle).
+- **Memory Gate:** `extract_memory=true` only for explicit durable prefs; `false` for BA117 / ADS-B / weather / filler.
 - **Fallback:** `_heuristic_plan` + `_heuristic_extract_memory` when supervisor LLM unavailable.
-- Writes routing notes into `turn_notes` for metro / `st.status` (full worker name list for the metro parser).
+- Writes one `{spoke: "supervisor", content: "..."}` note for metro.
 
-### Spoke 1 — OpenSky (`spoke_1_opensky_node`)
+### `opensky` (`spoke_1_opensky_node`)
 
-See [§7](#7-spoke-1--opensky-physical-airspace).
+See [§7](#7-spoke-1--opensky-physical-airspace). Does **not** read FlightAware notes. Hex / airport ICAO come from the user text, supervisor task, or prior chat (including a durable OpenSky stamp from an earlier turn).
 
-### Spoke 2 — live ops (`spoke_2_liveops_node`)
+### `flightaware` (`spoke_2_liveops_node`)
 
 1. Resolve ident via `_resolve_flight_ident`:
-   - `current_task` + latest user message first
-   - then `[Spoke_3_WebSearch]` notes from this turn (Tavily-discovered flight numbers)
-   - then prior `messages` **only** if the latest prompt has follow-up phrases (“this flight”, “mentioned before”, …)
+   - `flight_number` first (typed by the user or chosen at clarification)
+   - then this spoke's `plan` task, then `current_task`, then the latest user message
+   - then Tavily notes from this turn (almost never present under parallel `Send`)
+   - then prior `messages` **only** if the latest prompt has follow-up phrases
    - stopword filter blocks acronym false hits (`MEL`, `UTC`, `ILS`, …)
-2. If ident found → `flightaware_live_status`; else skip FA with a JSON note.
-3. Pack into one `[Spoke_2_LiveOps]` `turn_notes` entry (**no Tavily** — that is Spoke 3).
-4. Return to supervisor.
+2. If ident found → `flightaware_live_status` (NOAA METARs attach **only** on delay/hold/divert); else skip FA with a JSON note.
+3. Pack `{spoke: "flightaware", content: "..."}`.
 
-**Spoke 2 does not call an LLM** for tool selection — FA (+ conditional NOAA inside the FA tool).
+**No LLM** on this spoke — FA + conditional NOAA inside the tool.
 
-### Spoke 3 — web search (`spoke_3_websearch_node`)
+### `tavily` (`spoke_3_websearch_node`)
 
-1. Read `current_task` (fallback: latest user text).
-2. **Fast path (0 LLM):** no prior spoke outputs this turn → Tavily on `task` as-is.
-3. **Chained path (1 `spoke_llm`):** if Spoke 1/2/3 already wrote notes, refine the Tavily query via `WebSearchRefine` using those facts; soft-fail keeps the original task.
-4. Append `[Spoke_3_WebSearch] Query: …` so Spoke 2 can regex-discover idents next.
+1. Read this spoke’s `plan` task (fallback: latest user text).
+2. **Fast path (0 LLM):** usual parallel case — Tavily on the task as-is.
+3. **Chained path (1 `spoke_llm`):** only if sibling notes are already in the Send copy (rare now). Soft-fail keeps the original task.
+4. Pack `{spoke: "tavily", content: "..."}`. Discovery still works; same-turn FA lookup does **not** wait for it.
 
 ### Synthesizer (`synthesizer_node`)
 
-- **LLM:** Gemini `spoke_llm`.
-- Inputs: `turn_notes`, recent conversation, resolved ident.
-- Rules: trust FlightAware `headline`; honest codeshares; don’t invent marketed LH numbers / types from callsign alone; OpenSky gaps ≠ “flight doesn’t exist.”
-- **Durable OpenSky stamp:** if Spoke 1 returned live `states`, append a fixed `### OpenSky vector (durable)` block (icao24, callsign, alt, GS, VS, track, lat/lon, on_ground, squawk) so follow-ups can regex those ids from `messages`.
-- **Mem0 ingest (gated):** after the final string is ready, `_add_user_memory(...)` runs **only if** `state["extract_memory"]` is True. Otherwise skip ingestion entirely. Failures are logged and **never** crash the graph / stream.
-- Writes `final_report` + `AIMessage` into `messages`.
+- Sanitize `context_priority_order` to `{opensky, flightaware, tavily}` only; drop hallucinations and duplicate ids.
+- Sort `turn_notes` to that order. Every note for a spoke is grouped at that spoke's single slot. A spoke that returned data but was omitted from the list is appended. Supervisor notes go last.
+- Format the sorted list as markdown → Gemini `spoke_llm`.
+- Rules: trust FlightAware `headline`; if FA skipped but Tavily named flights, say live status was unavailable; don’t invent marketed numbers from callsign; OpenSky gaps ≠ “flight doesn’t exist.”
+- **Durable OpenSky stamp** when live `states` exist.
+- **Mem0 ingest** only if `extract_memory` is True.
 
 ---
 
@@ -351,8 +371,8 @@ Implementation: `src/mcp_servers/opensky_mcp.py` (+ planning in `nodes.py`).
 
 ### Planning
 
-1. Prefer hop-local `current_task`, else latest user ask + recent `messages` (**not** from `turn_notes`).
-2. **Fast path (0 LLM):** no `icao24` hex and no airport arrival/departure signal → heuristic only. Commercial flight numbers alone (e.g. AI101) cannot key OpenSky, so Spoke 1 returns a structured soft error instead of stalling on Gemini.
+1. Prefer this spoke’s `plan` task, else latest user ask + recent `messages` (**not** this-turn FlightAware notes).
+2. **Fast path (0 LLM):** no `icao24` hex and no airport arrival/departure signal → heuristic only. Commercial flight numbers alone (e.g. AI101) cannot key OpenSky, so the spoke returns a structured soft error instead of stalling on Gemini.
 3. Otherwise Gemini `with_structured_output(OpenSkyToolPlan)` → tool name + args, hard-capped at **~20s** wall clock (Gemini 429 retries otherwise hung the metro on “Physical Airspace”).
 4. Fallback: `_heuristic_opensky_plan` (regex hex / airport keywords). No fake default hex — missing `icao24` yields `{"ok": false, ...}`.
 5. `invoke_opensky_tool(plan.tool, **kwargs)` — drops `None`s; missing required args return soft-error JSON instead of crashing the graph.
@@ -416,18 +436,18 @@ File: `src/ui/metro_progress.py`.
 ### Friendly station names (`NODE_DISPLAY_MAP`)
 
 - `supervisor` → Flight Ops Router  
-- Spoke 3 → Web Research Engine  
-- Spoke 2 → Commercial Flight Engine  
-- Spoke 1 → Physical Airspace Radar Engine  
+- `tavily` → Web Research Engine  
+- `flightaware` → Commercial Flight Engine  
+- `opensky` → Physical Airspace Radar Engine  
 - `synthesizer` → Intelligence Synthesizer  
 
 ### Plan-ordered track (visual)
 
-The metro board is **not** a static Web → Commercial → Radar layout. On the first supervisor hop it rebuilds from the live plan list:
+The metro board rebuilds from `spokes_to_call` on the first supervisor hop:
 
-`Router → <spokes in supervisor plan order, unique first-seen> → Synthesizer`
+`Router → <planned spokes> → Synthesizer`
 
-Unplanned spokes are **omitted** (not shown as skipped placeholders). The strip is a **vertical numbered list** (top → bottom = execution order) rendered via `st.html` so Streamlit does not strip layout CSS. A **Plan order:** caption mirrors `plan_workers`. Active station highlights; API / rate-limit style failures can show **warn** (amber). Bare `"429"` digit noise inside Tavily scores is ignored so successful web research is not false-flagged. Spoke 1 live states also drive Altitude / Ground Speed / Vertical Rate / Transponder Hex metrics.
+Unplanned spokes are **omitted**. After the supervisor finishes, **all** planned spokes light **active at once** (parallel fan-out). The strip is a vertical numbered list via `st.html`. API / rate-limit style failures can show **warn** (amber). Bare `"429"` digit noise inside Tavily scores is ignored. OpenSky live states also drive Altitude / Ground Speed / Vertical Rate / Transponder Hex metrics.
 
 ### Streaming
 
@@ -474,7 +494,7 @@ Every graph stream / `update_state` uses `_thread_config(...)`:
 | `tags` | `entrypoint:{streamlit\|api\|…}`, optional `user:{user_id}` |
 | `metadata` | `thread_id`, `entrypoint`, optional `user_id` |
 | `configurable.thread_id` | Chat isolation key (unchanged) |
-| `recursion_limit` | `22` |
+| `recursion_limit` | `10` |
 
 Tags are built dynamically from `entrypoint` so a future API/notebook caller can pass `entrypoint="api"` without hardcoding UI labels.
 
@@ -532,10 +552,10 @@ aviation_agent/
     │   └── auth_db.py          # User + thread ownership
     ├── graph/
     │   ├── models.py           # get_supervisor_llm / get_spoke_llm (env-fresh)
-    │   ├── state.py            # AgentState (+ plan/{worker,task}, current_task, SPOKE_CAPS)
+    │   ├── state.py            # AgentState (+ spokes_to_call, context_priority_order)
     │   ├── nodes.py            # Supervisor, 3 spokes, synthesizer, Mem0 helpers
-    │   ├── supervisor.py       # Thin re-export of supervisor_node
-    │   └── workflow.py         # StateGraph (3 spokes) + SqliteSaver(checkpoints.db)
+    │   ├── supervisor.py       # Thin re-export of supervisor_node + SupervisorPlan
+    │   └── workflow.py         # StateGraph + Send() fan-out + SqliteSaver
     ├── mcp_servers/
     │   └── opensky_mcp.py      # OpenSky tools + OAuth + 10s timeouts + invoke dispatch
     ├── tools/
@@ -612,9 +632,10 @@ On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app
 - `What's the live status of AI8303? Include route, aircraft type, and codeshare operator if any.`
 - Follow-up: `Status of the flight I mentioned before?` (gated history walk should resolve the ident)
 
-**Airline / route without flight number (Spoke 3 → Spoke 2)**
+**Airline / route without flight number (Path 2: Tavily, then you pick)**
 
-- `Is there a Batik Air flight from India to KL today? What's the live status if you find a number?`
+- `What's the status of the Batik Air flight from KL to BLR?`
+- The run pauses with candidate idents. Reply with one (for example `ID8085`) and the next hop is Path 1 (FlightAware + OpenSky).
 
 **Web research only (Spoke 3)**
 
@@ -647,24 +668,27 @@ On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app
 3. **No registration → icao24 bridge** — FlightAware tails (e.g. `9V-SKQ`) do not auto-unlock OpenSky telemetry.
 4. **OpenSky ≠ commercial schedules** — cannot enumerate “all flights DEL→SIN.”
 5. **State vectors are brittle positional APIs** — mitigated by length checks + named mapping in MCP.
-6. **Spoke 2 tool choice is fixed** (FA if ident; NOAA on anomaly) — not Gemini-planned like Spoke 1. Spoke 3→2 ident handoff is still regex on notes, not a structured `discovered_ident` field.
-7. **NOAA enrichment is heuristic** — METAR ≠ proven root cause of delay.
-8. **LangSmith is live tracing, not a formal eval suite** — no golden-set harness / CI assertions yet; wrong regional endpoint → 403; bad keys fail soft.
-9. **Metro Agent-steps snapshots** are session-scoped extras (chat text is `SqliteSaver`-backed).
-10. **Offline heuristic planner** has some demo-tuned route phrases; live routing should prefer the supervisor LLM.
-11. **Gemini free-tier quotas are per-model** — exhausting `gemini-3.6-flash` does not mean `gemini-2.5-flash` is dead, but the process must actually load the new `SPOKE_MODEL`.
-12. **OpenSky without icao24 soft-fails fast** — flight-number-only radar asks will not invent a hex.
+6. **FlightAware tool choice is fixed** (FA if ident; NOAA on anomaly) — not Gemini-planned like OpenSky.
+7. **Path 2 needs a human ident.** Discovery no longer calls FlightAware blind, but it also does not auto-pick a candidate — the user must reply with one. A nonsense reply can loop until `recursion_limit=10`.
+8. Candidate flights are still regexed out of Tavily note text, not a structured `discovered_ident` field. `flight_number` is set only after the user (or the original prompt) supplies an ident.
+9. **NOAA enrichment is heuristic** — METAR ≠ proven root cause of delay. NOAA is not a graph spoke.
+10. **LangSmith is live tracing, not a formal eval suite** — no golden-set harness / CI assertions yet; wrong regional endpoint → 403; bad keys fail soft.
+11. **Metro Agent-steps snapshots** are session-scoped extras (chat text is `SqliteSaver`-backed).
+12. **Offline heuristic planner** has some demo-tuned route phrases; live routing should prefer the supervisor LLM.
+13. **Gemini free-tier quotas are per-model** — exhausting `gemini-3.6-flash` does not mean `gemini-2.5-flash` is dead, but the process must actually load the new `SPOKE_MODEL`.
+14. **OpenSky without icao24 soft-fails fast** — flight-number-only radar asks will not invent a hex.
 
 ---
 
 ## 17) Interview / design talking points
 
-- Why Plan-and-Execute with a capped `{worker, task}` queue beats unbounded tool loops for demo cost control.
-- Why `messages` (durable per `thread_id` in `SqliteSaver`) vs `turn_notes` (scratch) vs Mem0 (prefs per `user_id`).
-- Why OpenSky vs FlightAware vs Tavily is a **three-way domain split**.
-- Why Spoke 3 is fast-path (0 LLM) vs chained refine (1 Gemini) for cost control.
-- Why Spoke 1 uses structured `OpenSkyToolPlan` (with icao24 gate + 20s planning cap + 10s HTTP) while Spoke 2 stays tool-only and Spoke 3 only optionally refines.
-- Why the metro board is rebuilt from the supervisor plan list (not a static Web→FA→Radar track).
+- Why `Send` fan-out / fan-in beats a sequential supervisor loop for independent domains (OpenSky hex vs FA ident vs Tavily research).
+- Why that same pattern **breaks** Tavily discovery → FlightAware lookup on one turn — and what a second map-reduce hop / structured `discovered_ident` would fix.
+- Why `messages` (durable per `thread_id`) vs `turn_notes` (`operator.add` + `[]` clear) vs `context_priority_order` (synthesizer pack, not execution order).
+- Why OpenSky vs FlightAware vs Tavily is a **three-way domain split**, and why NOAA stays inside FlightAware (delay gate + origin/dest from AeroAPI).
+- Why FlightAware / Tavily must sit at an edge of `context_priority_order` (lost-in-the-middle).
+- Why OpenSky keys only on hex / airport ICAO in the user/chat text — not on FlightAware tails.
+- Why the metro board lights **all** planned spokes at once.
 - Why gated history walk + stopwords for FlightAware idents (bleed vs follow-up).
 - Why synthesizer must be allowed to say **“cannot join”** commercial airframe ↔ ADS-B hex.
 - Why durable OpenSky stamps in `messages` matter for follow-up regex / memory.
@@ -672,7 +696,7 @@ On first graph compile, `workflow.py` creates/opens `checkpoints.db` beside `app
 - Why Mem0 import stays lazy in nodes (import side effects / boot isolation) and failures soft-noop.
 - Why `SqliteSaver` + `check_same_thread=False` fits Streamlit (multi-thread touches, still local file).
 - Why LangSmith tags are dynamic (`entrypoint` / `user`) and FlightAware uses `hide_inputs` for the API key.
-- Honest gaps: local SQLite / Mem0 stores, no reg→icao24 map, no offline eval suite, regex ident handoff.
+- Honest gaps: local SQLite / Mem0 stores, no reg→icao24 map, no same-turn Tavily→FA handoff, no offline eval suite.
 
 ---
 

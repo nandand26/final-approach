@@ -2,7 +2,9 @@
 
 This file is the "brains" of each graph step:
 - Helpers: small utilities (read user text, pick an LLM, keyword routing, etc.)
-- Nodes: supervisor, Spoke 1 (OpenSky physical airspace), Spoke 2 (live ops), synthesizer
+- Nodes: supervisor (fan-out plan), opensky, flightaware, tavily,
+  synthesizer (priority-packed fan-in). NOAA METARs enrich FlightAware
+  only when AeroAPI reports delay/hold/divert.
 
 LangGraph calls a node with the current AgentState, and the node returns
 a partial update (usually new messages + next_worker / final_report).
@@ -18,24 +20,32 @@ import time
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field, field_validator
 
-from src.graph.state import SPOKE_CAPS, AgentState
-from src.graph.models import get_spoke_llm, get_supervisor_llm
+from src.graph.state import (
+    MESSAGE_WINDOW,
+    SPOKE_CAPS,
+    VALID_FANOUT_SPOKES,
+    WORKER_TO_FANOUT,
+    AgentState,
+)
+from src.graph.models import (
+    SupervisorPlan,
+    get_spoke_llm,
+    get_supervisor_llm,
+)
 from src.mcp_servers.opensky_mcp import OPENSKY_TOOLS, invoke_opensky_tool
-from src.tools.live_ops import flightaware_live_status, tavily_aviation_web_search
+from src.tools.live_ops import (
+    flightaware_live_status,
+    tavily_aviation_web_search,
+)
 
 logger = logging.getLogger(__name__)
 
-# Allowed spoke names that may appear in the plan queue / next_worker.
-SPOKE_WORKERS = ("Spoke_1_OpenSky", "Spoke_2_LiveOps", "Spoke_3_WebSearch")
-# Allowed values for state["next_worker"] (spokes + synthesizer handoff).
-VALID_WORKERS = {
-    "Spoke_1_OpenSky",
-    "Spoke_2_LiveOps",
-    "Spoke_3_WebSearch",
-    "FINISH",
-}
+# Spoke ids are VALID_FANOUT_SPOKES: opensky, flightaware, tavily.
+# WORKER_TO_FANOUT is the only alias table. It rewrites Spoke_1_OpenSky,
+# noaa, and the other old names into those three ids before any check.
 
 # Acronyms that look like airline idents (letter+digit) but are not flight numbers.
 _FLIGHT_IDENT_STOPWORDS = frozenset(
@@ -237,39 +247,45 @@ def _llm_text(response: Any) -> str:
     return str(content).strip()
 
 
-def _spoke_results_present(turn_notes: list[str]) -> tuple[bool, bool]:
-    """Check whether Spoke 1 / Spoke 2 already ran at least once THIS turn.
+def _note_spoke(note: Any) -> str:
+    """Canonical fan-out id on a turn_note dict (or legacy string).
 
-    Looks only at turn_notes (scratch), not durable conversation messages.
-    Returns:
-        (spoke_1_done, spoke_2_done)
+    Dict notes already store the id in ``spoke``. Old string notes only have a
+    bracket tag such as ``[Spoke_2_LiveOps]``. Both go through WORKER_TO_FANOUT.
     """
-    spoke_1 = False
-    spoke_2 = False
-    for note in turn_notes:
-        text = str(note)
-        if "[Spoke_1_OpenSky]" in text:
-            spoke_1 = True
-        if "[Spoke_2_LiveOps]" in text:
-            spoke_2 = True
-    return spoke_1, spoke_2
+    if isinstance(note, dict):
+        raw = str(note.get("spoke") or "").strip()
+        return WORKER_TO_FANOUT.get(raw, raw.lower())
+    for tag in re.findall(r"\[([^\]]+)\]", str(note)): # 
+        mapped = WORKER_TO_FANOUT.get(tag.strip())
+        if mapped:
+            return mapped
+    return ""
+
+
+def _note_content(note: Any) -> str:
+    """Plain text payload of a turn_note dict or legacy string."""
+    if isinstance(note, dict):
+        return str(note.get("content") or "")
+    return str(note)
+
+
+def _spoke_note(spoke: str, content: str) -> dict[str, str]:
+    """Pack a spoke/supervisor note for operator.add fan-in."""
+    return {"spoke": spoke, "content": content}
 
 
 def _empty_spoke_counts() -> dict[str, int]:
-    return {name: 0 for name in SPOKE_WORKERS}
+    return {name: 0 for name in VALID_FANOUT_SPOKES}
 
 
-def _spoke_execution_counts(turn_notes: list[str]) -> dict[str, int]:
+def _spoke_execution_counts(turn_notes: list) -> dict[str, int]:
     """Count how many times each spoke already ran in THIS user-message turn."""
     counts = _empty_spoke_counts()
     for note in turn_notes:
-        text = str(note)
-        if "[Spoke_1_OpenSky]" in text:
-            counts["Spoke_1_OpenSky"] += 1
-        if "[Spoke_2_LiveOps]" in text:
-            counts["Spoke_2_LiveOps"] += 1
-        if "[Spoke_3_WebSearch]" in text:
-            counts["Spoke_3_WebSearch"] += 1
+        spoke = _note_spoke(note)
+        if spoke in counts:
+            counts[spoke] += 1
     return counts
 
 
@@ -295,8 +311,9 @@ def _normalize_plan_steps(plan: Any) -> list[dict[str, str]]:
     """Coerce LLM / heuristic plan items into [{"worker", "task"}, ...]."""
     normalized: list[dict[str, str]] = []
     for step in list(plan or []):
-        worker = _step_worker(step)
-        if worker not in SPOKE_WORKERS:
+        raw = _step_worker(step)
+        worker = WORKER_TO_FANOUT.get(raw, raw.strip().lower())
+        if worker not in VALID_FANOUT_SPOKES:
             continue
         task = _step_task(step)
         normalized.append({"worker": worker, "task": task})
@@ -451,76 +468,20 @@ def _heuristic_plan(user_text: str, history_blob: str) -> list[dict[str, str]]:
         return []
 
     plan: list[dict[str, str]] = []
-    if wants_opensky:
-        plan.append({"worker": "Spoke_1_OpenSky", "task": task})
-
-    # Live commercial ask without a flight number → discover idents via web, then FA
-    if wants_live and (wants_web or airline_route_without_ident) and not has_flight_ident:
-        plan.append({"worker": "Spoke_3_WebSearch", "task": task})
-        plan.append({"worker": "Spoke_2_LiveOps", "task": task})
-    else:
-        if wants_web and not wants_live:
-            plan.append({"worker": "Spoke_3_WebSearch", "task": task})
-        if wants_live:
-            plan.append({"worker": "Spoke_2_LiveOps", "task": task})
-
-    # Ambiguous aviation ask → prefer commercial live ops
-    if not plan and user_text.strip():
-        plan = [{"worker": "Spoke_2_LiveOps", "task": task}]
+    # Same three paths as the supervisor prompt. No ident means Tavily only.
+    if has_flight_ident and wants_live:
+        plan.append({"worker": "flightaware", "task": task})
+        plan.append({"worker": "opensky", "task": task})
+        if wants_web or any(
+            token in text for token in ("notam", "news", "advisory", "recall", "press")
+        ):
+            plan.append({"worker": "tavily", "task": task})
+    elif wants_opensky:
+        plan.append({"worker": "opensky", "task": task})
+    elif not has_flight_ident and (wants_live or airline_route_without_ident or wants_web):
+        plan.append({"worker": "tavily", "task": task})
 
     return _enforce_spoke_caps(plan)
-
-
-class PlannedStep(BaseModel):
-    """One sub-task in the supervisor's ordered execution queue."""
-
-    worker: Literal["Spoke_1_OpenSky", "Spoke_2_LiveOps", "Spoke_3_WebSearch"] = Field(
-        description="Which spoke should execute this sub-task.",
-    )
-    task: str = Field(
-        description=(
-            "Targeted sub-query for WebSearch, flight ident/route goal for LiveOps, "
-            "or icao24/airport task for OpenSky."
-        ),
-    )
-
-
-class SupervisorPlan(BaseModel):
-    """Structured plan the supervisor LLM must return at turn start.
-
-    `plan` is an ordered queue of {worker, task} steps. Empty list means
-    conversational bypass → go straight to FINISH / synthesizer (no tool calls).
-
-    `extract_memory` is the Memory Gate: True only for explicit durable prefs.
-    """
-
-    plan: list[PlannedStep] = Field(
-        default_factory=list,
-        description=(
-            "Ordered execution queue of PlannedStep objects. Allowed workers: "
-            "'Spoke_1_OpenSky', 'Spoke_2_LiveOps', 'Spoke_3_WebSearch'. "
-            "Use [] when the answer needs no tools (greetings, reformat, "
-            "questions answerable from existing chat context alone). "
-            f"Per-turn caps: {SPOKE_CAPS}."
-        ),
-    )
-    extract_memory: bool = Field(
-        default=False,
-        description=(
-            "Memory Gate. True ONLY if the latest user message explicitly dictates "
-            "how the assistant should behave, format answers, or remember personal "
-            "context for future interactions. False for standard aviation lookups, "
-            "flight status, ADS-B, weather, or conversational filler."
-        ),
-    )
-    reasoning: str = Field(
-        default="",
-        description=(
-            "Brief note on how chat history resolved ambiguous references "
-            "(e.g. 'that flight' → AI8303), why each spoke was scheduled, and "
-            "why extract_memory is true/false."
-        ),
-    )
 
 
 class WebSearchRefine(BaseModel):
@@ -567,26 +528,228 @@ def _heuristic_extract_memory(user_text: str) -> bool:
     return any(marker in text for marker in preference_markers)
 
 
+def _unique_fanout(names: list[str]) -> list[str]:
+    """Keep first-seen valid fan-out ids only.
+
+    Review: this is the allow-list used before Send. Aliases such as
+    Spoke_2_LiveOps or noaa are rewritten by WORKER_TO_FANOUT, then anything
+    that is still not opensky|flightaware|tavily is dropped. Duplicates go too.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in names:
+        worker = WORKER_TO_FANOUT.get(str(raw or "").strip(), str(raw or "").strip().lower())
+        if worker not in VALID_FANOUT_SPOKES or worker in seen:
+            continue
+        seen.add(worker)
+        out.append(worker)
+    return out
+
+
+def _default_context_priority_order(spokes: list[str]) -> list[str]:
+    """Pin FlightAware / Tavily at the start when selected (safety-critical edges).
+
+    Review: pack order for the synthesizer, not the order spokes execute.
+    FlightAware may carry NOAA METARs on delay; Tavily carries NOTAMs.
+    Those two are placed first so they are not buried in the middle of the prompt.
+    OpenSky, when selected, follows them.
+    """
+    selected = _unique_fanout(spokes)
+    safety = [s for s in ("flightaware", "tavily") if s in selected]
+    rest = [s for s in selected if s not in safety]
+    return safety + rest
+
+
+def _sanitize_context_priority_order(order: Any) -> list[str]:
+    """Keep only real spoke ids from the model's pack-order list.
+
+    Review: strict match only, no alias rewrite. "noaa" or "synthesizer" is
+    dropped here. A duplicate id is kept once, in the original order.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in list(order or []):
+        name = str(item).strip()
+        if name not in VALID_FANOUT_SPOKES or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _plan_from_spokes(
+    spokes: list[str],
+    user_text: str,
+    plan_steps: list[dict[str, str]] | None = None,
+    *,
+    flight_number: str | None = None,
+    search_query: str | None = None,
+) -> list[dict[str, str]]:
+    """One {worker, task} row for every spoke the router will Send.
+
+    Review: the supervisor's own task wins. A selected spoke with no task
+    gets a spoke-specific fallback:
+    FlightAware gets the ident, Tavily gets the search query, OpenSky gets
+    the user question. The returned list is what state["plan"] stores.
+    """
+    tasks: dict[str, str] = {}
+    for step in plan_steps or []:
+        worker = WORKER_TO_FANOUT.get(step.get("worker", ""), step.get("worker", ""))
+        task = str(step.get("task") or "").strip()
+        # Skip a row with an unknown worker or a blank task. The fallback below fills it.
+        if worker in VALID_FANOUT_SPOKES and task:
+            tasks[worker] = task
+
+    ident = (flight_number or "").strip()
+    query = (search_query or "").strip()
+    fallback = (user_text or "").strip()
+
+    def _default_task(spoke: str) -> str:
+        if spoke == "flightaware" and ident:
+            return ident
+        if spoke == "tavily" and query:
+            return query
+        return fallback
+
+    return [
+        {"worker": spoke, "task": tasks.get(spoke) or _default_task(spoke)}
+        for spoke in _unique_fanout(spokes)
+    ]
+
+
+def _task_for_spoke(state: AgentState, spoke: str) -> str:
+    """Task string for one spoke that Send is about to run.
+
+    Review: lookup order is that spoke's plan row, then current_task, then
+    the latest user message. OpenSky, FlightAware, and Tavily all call this.
+    Fan-in does not.
+    """
+    for step in _normalize_plan_steps(state.get("plan") or []):
+        if step.get("worker") == spoke and step.get("task"):
+            return str(step["task"])
+    return (
+        str(state.get("current_task") or "").strip()
+        or _latest_user_text(state)
+        or ""
+    )
+
+
+def _reorder_turn_notes(notes: list, priority_order: list[str]) -> list:
+    """Sort turn_notes to match sanitized context_priority_order.
+
+    Review: this is fan-in packing, after every spoke has written its note.
+    1) Bucket notes by spoke id. Supervisor notes are leftovers.
+    2) Emit buckets in the model's pack order.
+    3) A spoke that returned data but was missing from that order is appended,
+       so a payload is not dropped.
+    4) Supervisor and other non-spoke notes go last.
+    """
+    order = _sanitize_context_priority_order(priority_order)
+    buckets: dict[str, list] = {name: [] for name in VALID_FANOUT_SPOKES}
+    leftovers: list = []
+    for note in list(notes or []):
+        spoke = _note_spoke(note)
+        if spoke in buckets:
+            buckets[spoke].append(note)
+        else:
+            leftovers.append(note)
+
+    ordered: list = []
+    used: set[str] = set()
+    for spoke in order:
+        ordered.extend(buckets.get(spoke) or [])
+        used.add(spoke)
+    # Spoke returned data but was left out of context_priority_order.
+    for spoke in VALID_FANOUT_SPOKES:
+        if spoke not in used and buckets.get(spoke):
+            ordered.extend(buckets[spoke])
+    ordered.extend(leftovers)
+    return ordered
+
+
+def _format_notes_markdown(notes: list) -> str:
+    """Turn the sorted notes into one markdown string for the synthesizer LLM.
+
+    Review: each section is "## <spoke id>" plus the note text. This string
+    is the only tool output the writer model sees.
+    """
+    sections: list[str] = []
+    for note in notes:
+        spoke = _note_spoke(note) or "note"
+        content = _note_content(note).strip()
+        if not content:
+            continue
+        sections.append(f"## {spoke}\n\n{content}")
+    return "\n\n".join(sections)
+
+
+_SUPERVISOR_INTENTS = (
+    "telemetry_known",
+    "telemetry_discovery",
+    "general_knowledge",
+    "direct_chat",
+)
+
+
+def _offline_supervisor(
+    user_text: str,
+    history_blob: str,
+) -> tuple[list[dict[str, str]], list[str], list[str], bool, str, str | None, str | None]:
+    """Keyword plan used only when the supervisor model is unavailable.
+
+    Does not rewrite a model decision. Labels intent from the spokes this
+    fallback itself chose, using the same three paths as the prompt.
+    """
+    plan = _heuristic_plan(user_text, history_blob)
+    spokes = _unique_fanout([step["worker"] for step in plan])
+    ident = _find_ident_in_text(user_text)
+    blob = f"{user_text}\n{history_blob}".lower()
+    live_route = any(
+        token in blob
+        for token in ("status", "track", "live", "delay", "eta", "flight from", "flights from")
+    )
+    if not spokes:
+        intent, flight_number, search_query = "direct_chat", None, None
+    elif "flightaware" in spokes or "opensky" in spokes:
+        intent = "telemetry_known"
+        flight_number = ident
+        search_query = user_text if "tavily" in spokes else None
+    elif live_route:
+        intent = "telemetry_discovery"
+        flight_number, search_query = None, user_text
+    else:
+        intent = "general_knowledge"
+        flight_number, search_query = None, user_text
+    plan = _plan_from_spokes(
+        spokes,
+        user_text,
+        plan,
+        flight_number=flight_number,
+        search_query=search_query,
+    )
+    return (
+        plan,
+        spokes,
+        _default_context_priority_order(spokes),
+        _heuristic_extract_memory(user_text),
+        intent,
+        flight_number,
+        search_query,
+    )
+
+
 def _llm_generate_plan(
     user_text: str,
     history_blob: str,
     memory_facts: list[str] | None = None,
-) -> tuple[list[dict[str, str]], bool]:
-    """Ask the supervisor LLM for an ordered {worker,task} plan + Memory Gate flag.
+) -> tuple[list[dict[str, str]], list[str], list[str], bool, str, str | None, str | None]:
+    """Ask the supervisor LLM for intent, spokes, pack order, and Memory Gate.
 
-    CONTEXT AWARENESS:
-    - `history_blob` is the recent `messages` transcript (user + prior finals).
-    - The prompt explicitly requires resolving pronouns / implicit refs
-      ("that flight", "yesterday's delay") against that history BEFORE planning.
-    - `memory_facts` are cross-session Mem0 preferences (units, formatting, etc.).
-    - `extract_memory` is True only for explicit durable preference statements.
+    Returns (plan, spokes, priority, extract_memory, intent, flight_number, search_query).
     """
     model = get_supervisor_llm()
     if model is None:
-        return (
-            _heuristic_plan(user_text, history_blob),
-            _heuristic_extract_memory(user_text),
-        )
+        return _offline_supervisor(user_text, history_blob)
 
     memory_block = ""
     if memory_facts:
@@ -602,50 +765,66 @@ def _llm_generate_plan(
         )
 
     system_prompt = (
-        "You are the aviation fleet intelligence supervisor operating under a Plan-and-Execute architecture.\n"
-        "At the START of each user turn you must (1) build an ordered `plan` queue of "
-        "{worker, task} steps and (2) set the Memory Gate flag `extract_memory`.\n\n"
-        "CONTEXT & AMBIGUITY RESOLUTION:\n"
-        "- Read the full chat history alongside the latest user query.\n"
-        "- Resolve implicit references using prior context before picking spokes.\n"
+        "You are the aviation fleet intelligence supervisor. You alone choose the "
+        "path. Classify EVERY turn into exactly one intent, then choose spokes and "
+        "the task each spoke runs. Nothing downstream will change your intent or "
+        "your spoke list.\n\n"
+        "HARD RULES:\n"
+        "1. Known ident. The latest message contains a flight ident (BA117, SQ32, "
+        "ID8085), or the user just replied with one. intent is telemetry_known. "
+        "You choose which of opensky, flightaware, and tavily are needed. "
+        "Every spoke you put in spokes_to_call runs in parallel. "
+        "flight_number is that ident.\n"
+        "2. Unknown ident. Live status by airline or route with NO ident "
+        "(Batik Air from KL to BLR). intent is telemetry_discovery. "
+        "spokes_to_call is exactly [tavily]. flight_number is null. "
+        "Never flightaware. Never opensky. Tavily finds candidates, then a human "
+        "picks the ident. Do not pick one yourself.\n"
+        "3. General research. Regulations, specs, theory, or news with no live "
+        "tracking. intent is general_knowledge. spokes_to_call is exactly [tavily]. "
+        "Never flightaware. Never opensky. flight_number is null.\n"
+        "4. Greeting or reformat, or anything the chat already answers. "
+        "intent is direct_chat. spokes_to_call is [] and plan is [].\n\n"
+        "EXAMPLES:\n"
+        "- 'Status of BA117' → telemetry_known, flight_number BA117, "
+        "the spokes you need (for example flightaware, or flightaware + opensky).\n"
+        "- 'Status of BA117 and Heathrow NOTAMs' → telemetry_known, "
+        "flightaware and tavily in parallel.\n"
+        "- 'Status of Batik Air from KL to BLR' → telemetry_discovery, "
+        "[tavily] only, flight_number null.\n"
+        "- User then replies 'ID8085' → telemetry_known for ID8085, "
+        "whatever spokes that ident needs, in parallel.\n"
+        "- 'What is a METAR?' → general_knowledge, [tavily].\n"
+        "- 'Hi' → direct_chat, no spokes.\n\n"
+        "CONTEXT:\n"
+        "- Read the full chat history before classifying. Resolve 'that flight' "
+        "and a bare ident from the earlier turn.\n"
         f"{memory_block}"
-        "SPOKE CAPABILITIES (strict domain split):\n"
-        "- Spoke_1_OpenSky = physical ADS-B radar (icao24 hex, airport arrivals/"
-        "departures, tracks). DO NOT use for commercial flight numbers, schedules, "
-        "equipment types, METAR, or web research.\n"
-        "- Spoke_2_LiveOps = FlightAware commercial status & NOAA METARs "
-        "(flight numbers, tail registrations, codeshares). NO Tavily / web search.\n"
-        "- Spoke_3_WebSearch = Tavily web search (general aviation research, route "
-        "schedules, finding flight numbers for an airline/route when no flight ident "
-        "is given, airport transit).\n\n"
-        "PLANNING & ORDERING RULES:\n"
-        "- Known flight number / delay / weather / aircraft-type → Spoke_2_LiveOps "
-        "with that ident/goal in `task`.\n"
-        "- Live flight by airline/route WITHOUT a flight number "
-        "(e.g. \"Batik Air flight from India to KL\") → schedule Spoke_3_WebSearch "
-        "FIRST (discover flight numbers) THEN Spoke_2_LiveOps (live AeroAPI status). "
-        "Put a focused discovery query in the WebSearch `task` and a status-check "
-        "goal in the LiveOps `task`.\n"
-        "- icao24 / altitude / trajectory / ADS-B airport movements → Spoke_1_OpenSky.\n"
-        "- Pure research / schedules / transit with no live FA need → Spoke_3_WebSearch alone.\n"
-        "- Hybrid queries may include multiple spokes, ordered by what the user needs first.\n"
-        f"- Per-spoke caps this turn: {SPOKE_CAPS}. Do not exceed them.\n"
-        "- NEVER place 'FINISH' or synthesizer nodes inside the `plan` array.\n"
-        "- Every plan item MUST include a non-empty `task` string tailored to that spoke.\n\n"
-        "DIRECT BYPASS RULE:\n"
-        "- If conversational / reformat / answerable from chat alone, return an empty plan: `[]`.\n\n"
-        "MEMORY GATE (`extract_memory`) — treat Mem0 as an immutable configuration file:\n"
-        "- Set extract_memory=true ONLY if the latest user message explicitly dictates how "
-        "you should behave, format answers, or remember their personal context for future "
-        "interactions. Capture only explicit, durable rules.\n"
-        "- Set extract_memory=false for standard aviation questions, flight lookups, "
-        "ADS-B/radar, weather/delay asks, or conversational filler.\n"
-        "- FALSE examples: \"What is the status of BA117?\", "
-        "\"Pull live ADS-B for icao24 4cc2a3.\", "
-        "\"Is the flight delayed due to weather?\"\n"
-        "- TRUE examples: \"Always report altitudes in meters, never feet.\", "
-        "\"I am a commercial dispatcher, keep your answers in bullet points.\"\n"
-        "- When in doubt, set extract_memory=false."
+        "SPOKE CAPABILITIES:\n"
+        "- opensky = ADS-B by icao24 hex or airport ICAO. Soft-fails without a hex.\n"
+        "- flightaware = AeroAPI status. NOAA METARs run INSIDE this spoke only "
+        "on delay/hold/divert. Requires a flight ident.\n"
+        "- tavily = web research, NOTAMs, and flight-number discovery.\n\n"
+        "PLAN (`plan`) — required, one row per spoke in spokes_to_call:\n"
+        "- worker is the spoke id. task is the exact text that spoke must run.\n"
+        "- flightaware task = the flight ident only (BA117).\n"
+        "- opensky task = the icao24 hex or airport ICAO question.\n"
+        "- tavily task = the web, NOTAM, or discovery query.\n"
+        "- spokes_to_call and plan workers must be the same set. "
+        "Do not omit plan when spokes_to_call is non-empty.\n\n"
+        "Also return flight_number (ident or null) and search_query "
+        "(Tavily string, or null when Tavily is not selected).\n"
+        f"At most one of each spoke ({ {k: SPOKE_CAPS[k] for k in VALID_FANOUT_SPOKES} }).\n"
+        "NEVER emit noaa, FINISH, or synthesizer as a spoke.\n\n"
+        "CONTEXT PRIORITY ORDER (pack order, not execution order):\n"
+        "- If flightaware and/or tavily are selected, put them at the absolute "
+        "start OR end of context_priority_order (lost-in-the-middle). "
+        "Only ids: opensky, flightaware, tavily.\n\n"
+        "MEMORY GATE (`extract_memory`):\n"
+        "- true ONLY when the latest message explicitly sets how you should "
+        "behave, format answers, or remember personal context.\n"
+        "- false for flight lookups, ADS-B, weather, news, and chat.\n"
+        "- Existing Mem0 facts do not make this turn true. When in doubt, false."
     )
     try:
         structured = model.with_structured_output(SupervisorPlan)
@@ -657,24 +836,52 @@ def _llm_generate_plan(
                         "Recent conversation history (use this to resolve references):\n"
                         f"{history_blob or '(none)'}\n\n"
                         f"Latest user query:\n{user_text}\n\n"
-                        "Return a SupervisorPlan with an ordered `plan` of "
-                        "{worker, task} steps and extract_memory true/false per "
-                        "the Memory Gate rules."
+                        "Return a SupervisorPlan with intent, flight_number, search_query, "
+                        "spokes_to_call, plan (one {worker, task} per spoke), "
+                        "context_priority_order, and extract_memory."
                     )
                 ),
             ]
         )
         if isinstance(result, dict):
             result = SupervisorPlan.model_validate(result)
-        raw_plan = list(getattr(result, "plan", []) or [])
+        raw_plan = _enforce_spoke_caps(list(getattr(result, "plan", []) or []))
+        spokes = _unique_fanout(list(getattr(result, "spokes_to_call", []) or []))
+        if not spokes and raw_plan:
+            spokes = _unique_fanout([step["worker"] for step in raw_plan])
+        intent = str(getattr(result, "intent", "") or "").strip()
+        if intent not in _SUPERVISOR_INTENTS:
+            intent = "direct_chat"
+        # Discovery and research are Tavily only. A greeting runs nothing.
+        # A known ident keeps whatever spokes the supervisor selected.
+        if intent in {"telemetry_discovery", "general_knowledge"}:
+            spokes = ["tavily"]
+        elif intent == "direct_chat":
+            spokes = []
+        flight_number = (getattr(result, "flight_number", None) or "").strip() or None
+        search_query = (getattr(result, "search_query", None) or "").strip() or None
+        plan = _plan_from_spokes(
+            spokes,
+            user_text,
+            raw_plan,
+            flight_number=flight_number,
+            search_query=search_query,
+        )
+        priority = _sanitize_context_priority_order(
+            getattr(result, "context_priority_order", None)
+        )
+        if not priority:
+            priority = _default_context_priority_order(spokes)
+        selected = set(spokes)
+        if ("flightaware" in selected or "tavily" in selected) and priority:
+            mid = priority[1:-1] if len(priority) > 2 else []
+            if "flightaware" in mid or "tavily" in mid:
+                priority = _default_context_priority_order(spokes)
         extract_memory = bool(getattr(result, "extract_memory", False))
-        return _enforce_spoke_caps(raw_plan), extract_memory
+        return plan, spokes, priority, extract_memory, intent, flight_number, search_query
     except Exception:
         logger.exception("Supervisor plan generation failed; using heuristic plan.")
-        return (
-            _heuristic_plan(user_text, history_blob),
-            _heuristic_extract_memory(user_text),
-        )
+        return _offline_supervisor(user_text, history_blob)
 
 
 # ---------------------------------------------------------------------------
@@ -682,125 +889,82 @@ def _llm_generate_plan(
 # ---------------------------------------------------------------------------
 
 def supervisor_node(state: AgentState) -> dict:
-    """Plan-and-Execute supervisor: build a turn plan once, then pop/execute it.
+    """Classify the turn, then expose spokes for Send / discovery / bypass.
 
-    Lifecycle for ONE user message turn:
-    1) Turn start (`turn_notes` empty after app reset) → generate `plan` from
-       latest query + full recent `messages` (resolves 'that flight', etc.).
-    2) Each supervisor visit → pop the next step from `plan` into
-       `next_worker` + `current_task`.
-    3) Empty `plan` → `FINISH` (synthesizer). An empty plan at generation time
-       is an intentional conversational/direct bypass (saves tool latency/cost).
-    4) Hard caps: per-worker limits from SPOKE_CAPS (2 / 2 / 5).
+    Routing itself lives in workflow._route_after_supervisor (reads `intent`).
+    Discovery does not call FlightAware until the human picks an ident and
+    this node runs again.
     """
     user_text = _latest_user_text(state)
     user_id = str(state.get("user_id") or "").strip()
-    turn_notes = list(state.get("turn_notes") or [])
-    plan = _normalize_plan_steps(state.get("plan") or [])
 
-    # Build a compact history blob from durable messages for reference resolution.
-    # WHY messages (not turn_notes): prior final answers contain flight numbers /
-    # delays the user may refer to implicitly in the new prompt.
-    history_parts = [_message_text(m)[:400] for m in state.get("messages", [])[-8:]]
+    history_parts = [
+        _message_text(m) for m in state.get("messages", [])[-MESSAGE_WINDOW:]
+    ]
     history_blob = "\n---\n".join(part for part in history_parts if part.strip())
 
-    # ----- Phase A: TURN START — generate the plan once -----
-    # Signal: turn_notes was reset to [] by app.py at the start of this prompt.
-    if not turn_notes:
-        # Mem0 retrieval at plan-build time so supervisor_llm honors cross-session prefs.
-        memory_facts = _search_user_memories(user_text, user_id, limit=3)
-        memory_note = ""
-        if memory_facts:
-            memory_note = " Mem0 prefs: " + "; ".join(memory_facts[:3]) + "."
+    memory_facts = _search_user_memories(user_text, user_id, limit=3)
+    memory_note = ""
+    if memory_facts:
+        memory_note = " Mem0 prefs: " + "; ".join(memory_facts[:3]) + "."
 
-        plan, extract_memory = _llm_generate_plan(
-            user_text, history_blob, memory_facts=memory_facts
+    plan, spokes, priority, extract_memory, intent, flight_number, search_query = (
+        _llm_generate_plan(user_text, history_blob, memory_facts=memory_facts)
+    )
+    plan = _enforce_spoke_caps(plan, already_ran=_empty_spoke_counts())
+    spokes = _unique_fanout(spokes or [s["worker"] for s in plan])
+    plan = _plan_from_spokes(
+        spokes,
+        user_text,
+        plan,
+        flight_number=flight_number,
+        search_query=search_query,
+    )
+    priority = _sanitize_context_priority_order(priority) or _default_context_priority_order(
+        spokes
+    )
+    gate_note = f" extract_memory={extract_memory}."
+    current_task = (plan[0].get("task") if plan else "") or (search_query or user_text)
+
+    if intent == "direct_chat" or not spokes:
+        note = (
+            "[supervisor] Empty plan (conversational/direct bypass) → FINISH. "
+            f"intent={intent or 'direct_chat'}."
+            + memory_note
+            + gate_note
         )
-        # Defensive re-check with zero prior executions this turn.
-        plan = _enforce_spoke_caps(plan, already_ran=_empty_spoke_counts())
-        gate_note = f" extract_memory={extract_memory}."
-
-        if not plan:
-            # Empty plan → immediate synthesizer handoff.
-            # WHY: conversational / reformat / context-only asks do not need tools;
-            # skipping spokes cuts latency and API overhead.
-            return {
-                "plan": [],
-                "next_worker": "FINISH",
-                "current_task": "",
-                "extract_memory": extract_memory,
-                "turn_notes": [
-                    "[supervisor] Empty plan (conversational/direct bypass) → FINISH. "
-                    "No spokes scheduled; synthesizer will use chat context only."
-                    + memory_note
-                    + gate_note
-                ],
-            }
-
-        # Pop the first planned step; remaining queue stays in state for later hops.
-        head = plan[0]
-        next_worker = head["worker"]
-        current_task = head.get("task") or user_text
-        remaining = plan[1:]
-        workers_for_note = [next_worker] + [s["worker"] for s in remaining]
         return {
-            "plan": remaining,
-            "next_worker": next_worker,
-            "current_task": current_task,
+            "intent": "direct_chat" if not spokes else intent,
+            "flight_number": flight_number,
+            "search_query": search_query,
+            "plan": [],
+            "spokes_to_call": [],
+            "context_priority_order": [],
+            "next_worker": "FINISH",
+            "current_task": "",
             "extract_memory": extract_memory,
-            "turn_notes": [
-                f"[supervisor] Plan generated from query + chat history: "
-                f"{workers_for_note}. "
-                f"Executing {next_worker} "
-                f"(task={current_task!r}; caps={SPOKE_CAPS})."
-                + memory_note
-                + gate_note
-            ],
+            "turn_notes": [_spoke_note("supervisor", note)],
         }
 
-    # ----- Phase B: IN-FLIGHT — continue draining the existing plan -----
-    already_ran = _spoke_execution_counts(turn_notes)
-    # Re-sanitize remaining queue against how many times each spoke already ran.
-    plan = _enforce_spoke_caps(plan, already_ran=already_ran)
-
-    if not plan:
-        # All planned steps done (or nothing left after cap filtering) → synthesize.
-        return {
-            "plan": [],
-            "next_worker": "FINISH",
-            "current_task": "",
-            "turn_notes": [
-                "[supervisor] Plan queue empty after spoke execution(s) → FINISH."
-            ],
-        }
-
-    head = plan[0]
-    next_worker = head["worker"]
-    current_task = head.get("task") or user_text
-    remaining = plan[1:]
-    cap = SPOKE_CAPS.get(next_worker, 0)
-
-    # Final defensive gate: never dispatch a spoke that already hit the per-turn cap.
-    if already_ran.get(next_worker, 0) >= cap:
-        return {
-            "plan": [],
-            "next_worker": "FINISH",
-            "current_task": "",
-            "turn_notes": [
-                f"[supervisor] Spoke cap reached for {next_worker} "
-                f"({cap}/turn). Forcing FINISH."
-            ],
-        }
-
+    task_bits = ", ".join(f"{step['worker']}={step['task']!r}" for step in plan)
+    note = (
+        f"[supervisor] Plan generated from query + chat history: {spokes}. "
+        f"intent={intent}. flight_number={flight_number or 'NONE'}. "
+        f"Tasks: {task_bits}. Priority {priority}."
+        + memory_note
+        + gate_note
+    )
     return {
-        "plan": remaining,
-        "next_worker": next_worker,
+        "intent": intent,
+        "flight_number": flight_number,
+        "search_query": search_query,
+        "plan": plan,
+        "spokes_to_call": spokes,
+        "context_priority_order": priority,
+        "next_worker": spokes[0],
         "current_task": current_task,
-        "turn_notes": [
-            f"[supervisor] Continuing plan → {next_worker} "
-            f"(task={current_task!r}). Remaining workers: "
-            f"{[s['worker'] for s in remaining]}."
-        ],
+        "extract_memory": extract_memory,
+        "turn_notes": [_spoke_note("supervisor", note)],
     }
 
 
@@ -1003,41 +1167,40 @@ def spoke_1_opensky_node(state: AgentState) -> dict:
     Plans one OpenSky tool call (structured LLM or heuristic), invokes the
     matching MCP tool function, and writes the JSON result into turn_notes.
     """
-    # Prefer hop-local supervisor task (may mention icao24 from prior Spoke 2).
-    user_text = (
-        str(state.get("current_task") or "").strip()
-        or _latest_user_text(state)
-        or "live aircraft telemetry"
-    )
-    history = _conversation_texts(state, limit=4)
-    planning_text = user_text
-    if history:
-        planning_text = (
-            f"Latest user query: {user_text}\n\n"
-            f"Recent conversation context:\n" + "\n---\n".join(history)
+    try:
+        user_text = _task_for_spoke(state, "opensky") or "live aircraft telemetry"
+        history = _conversation_texts(state, limit=MESSAGE_WINDOW)
+        planning_text = user_text
+        if history:
+            planning_text = (
+                f"Latest user query: {user_text}\n\n"
+                f"Recent conversation context:\n" + "\n---\n".join(history)
+            )
+
+        plan, source = _plan_opensky_tool(planning_text)
+        kwargs: dict[str, Any] = {
+            "icao24": plan.icao24,
+            "airport": plan.airport,
+            "begin": plan.begin,
+            "end": plan.end,
+            "bbox": plan.bbox,
+            "t": plan.t,
+        }
+        result = invoke_opensky_tool(plan.tool, **kwargs)
+        content = (
+            f"[Spoke_1_OpenSky] source={source}\n"
+            f"tool={plan.tool}\n"
+            f"args={ {k: v for k, v in kwargs.items() if v is not None} }\n\n"
+            f"OpenSky result:\n{result}"
         )
-
-    # 1) Decide which OpenSky tool + args
-    plan, source = _plan_opensky_tool(planning_text)
-
-    # 2) Invoke the MCP tool implementation (in-process; same code as stdio server)
-    kwargs: dict[str, Any] = {
-        "icao24": plan.icao24,
-        "airport": plan.airport,
-        "begin": plan.begin,
-        "end": plan.end,
-        "bbox": plan.bbox,
-        "t": plan.t,
-    }
-    result = invoke_opensky_tool(plan.tool, **kwargs)
-
-    content = (
-        f"[Spoke_1_OpenSky] source={source}\n"
-        f"tool={plan.tool}\n"
-        f"args={ {k: v for k, v in kwargs.items() if v is not None} }\n\n"
-        f"OpenSky result:\n{result}"
-    )
-    return {"turn_notes": [content]}
+        return {"turn_notes": [_spoke_note("opensky", content)]}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OpenSky spoke failed; returning error note.")
+        return {
+            "turn_notes": [
+                _spoke_note("opensky", f"[opensky] error: {exc}")
+            ]
+        }
 
 
 # Backward-compatible alias if anything still imports the old name
@@ -1118,18 +1281,132 @@ def _find_ident_in_text(user_text: str) -> str | None:
     return None
 
 
+class CandidateFlights(BaseModel):
+    """Marketed flight idents pulled from Tavily notes. Extraction only."""
+
+    idents: list[str] = Field(
+        default_factory=list,
+        description="Up to 6 marketed flight identifiers, such as ID8085 or BA117.",
+    )
+
+    @field_validator("idents")
+    @classmethod
+    def _cap_idents(cls, value: list[str]) -> list[str]:
+        """Keep the first 6 distinct idents. A longer list must not fail validation."""
+        found: list[str] = []
+        for ident in value or []:
+            text = str(ident).strip()
+            if text and text not in found:
+                found.append(text)
+            if len(found) >= 6:
+                break
+        return found
+
+
+def _extract_candidate_flights(notes: list) -> list[str]:
+    """Ask Gemini for idents in the raw Tavily notes. It does not write the question."""
+    raw_notes = [
+        _note_content(note).strip()
+        for note in notes or []
+        if _note_spoke(note) == "tavily" and _note_content(note).strip()
+    ]
+    if not raw_notes:
+        return []
+    model = get_spoke_llm()
+    if model is None:
+        return []
+    try:
+        structured = model.with_structured_output(CandidateFlights)
+        result = structured.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Extract marketed flight identifiers from the research notes. "
+                        "Return at most 6 idents, for example ID8085 or BA117. "
+                        "Return only the ident strings in `idents`. "
+                        "Do not write a question, sentence, or explanation."
+                    )
+                ),
+                HumanMessage(content="\n\n".join(raw_notes)),
+            ]
+        )
+        if isinstance(result, dict):
+            result = CandidateFlights.model_validate(result)
+        return list(getattr(result, "idents", []) or [])
+    except Exception:
+        logger.exception("Candidate flight extraction failed.")
+        return []
+
+
+def clarification_node(state: AgentState) -> Command:
+    """Path 2 pause: show Tavily candidates, then loop back to the supervisor.
+
+    Gemini only extracts idents. This node fills a fixed question string.
+    `interrupt()` checkpoints here. Streamlit resumes with Command(resume=...).
+    The human reply is the only new message — discovery JSON stays out of `messages`.
+    No static edge leaves this node; `Command(goto="supervisor")` is the only route.
+    """
+    idents = _extract_candidate_flights(list(state.get("turn_notes") or []))
+    if idents:
+        question = (
+            "I found these candidate flights: "
+            f"{', '.join(idents)}. Reply with the exact identifier to track."
+        )
+    else:
+        question = (
+            "I couldn't pick a flight number from web research. "
+            "Reply with the Flight Number or Tail Number to track (for example BA117)."
+        )
+    # Pause. interrupt() checkpoints this thread and does not continue to the
+    # supervisor. Example payload after Tavily finds two Batik flights:
+    #   {"question": "I found these candidate flights: ID8085, ID8086. "
+    #    "Reply with the exact identifier to track.",
+    #    "options": ["ID8085", "ID8086"]}
+    #
+    # Streamlit reads it on the next rerun: app_graph.get_state() exposes
+    # snapshot.interrupts, and _interrupt_payload pulls out this dict.
+    # _format_interrupt_markdown shows `question` in an assistant bubble.
+    # The idents are already inside that sentence, so `options` is not drawn
+    # again as buttons or a second list. The chat box placeholder becomes
+    # "Reply with a flight ident...".
+    #
+    # Resume is not a new turn. The user types ID8085 and Streamlit streams
+    # Command(resume="ID8085"). That string is what interrupt() returns here
+    # as user_selection.
+    #
+    # Hand-off: store HumanMessage("ID8085"), clear turn_notes, and
+    # Command(goto="supervisor"). The next rerun shows ID8085 as the user
+    # bubble. The supervisor classifies it again, usually telemetry_known,
+    # and can Send FlightAware and OpenSky.
+    user_selection = interrupt({"question": question, "options": idents})
+    selection = str(user_selection or "").strip() or "none"
+    return Command(
+        goto="supervisor",
+        update={
+            "messages": [HumanMessage(content=selection)],
+            "turn_notes": [],
+        },
+    )
+
+
 def _resolve_flight_ident(state: AgentState) -> str | None:
     """Resolve flight/tail with priority that avoids cross-turn regex bleed.
 
     Order:
-      1) `current_task` + latest user message
-      2) `[Spoke_3_WebSearch]` notes — airline flights only (Tavily discovery)
-      3) Prior messages only when the latest prompt has explicit follow-up phrases
+      1) Supervisor `flight_number` (typed by the user or chosen at clarification)
+      2) `current_task` + latest user message
+      3) Tavily notes from this turn (usually empty under parallel Send)
+      4) Prior messages only when the latest prompt has explicit follow-up phrases
     """
+    explicit = str(state.get("flight_number") or "").strip()
+    if explicit:
+        return _find_ident_in_text(explicit) or explicit.upper()
+
+    flightaware_task = _task_for_spoke(state, "flightaware")
     current_task = str(state.get("current_task") or "").strip()
     latest = _latest_user_text(state) or ""
 
-    for text in (current_task, latest):
+    for text in (flightaware_task, current_task, latest):
         if not text:
             continue
         found = _find_ident_in_text(text)
@@ -1139,8 +1416,9 @@ def _resolve_flight_ident(state: AgentState) -> str | None:
     # Web research notes: only accept airline idents (EK568), never N-tails/regs
     # from noisy article bodies (engine N1, special liveries A6-EEP, etc.).
     for note in state.get("turn_notes") or []:
-        text = str(note)
-        if text.startswith("[Spoke_3_WebSearch]"):
+        spoke = _note_spoke(note)
+        text = _note_content(note)
+        if spoke == "tavily" or text.startswith("[Spoke_3_WebSearch]"):
             found = _find_airline_flight_in_text(text)
             if found:
                 return found
@@ -1162,133 +1440,132 @@ def _extract_flight_ident(user_text: str) -> str:
 def spoke_2_liveops_node(state: AgentState) -> dict:
     """Specialist 2: FlightAware commercial status + conditional NOAA METARs.
 
-    Tavily web search lives on Spoke_3_WebSearch — not here.
-    Ident resolution prefers current_task / latest message / Spoke 3 notes.
+    NOAA is not a separate spoke. `flightaware_live_status` calls
+    `_enrich_formatted_with_noaa` only when AeroAPI reports delay/hold/divert.
     """
-    user_text = _latest_user_text(state) or "current flight operations"
-    task = str(state.get("current_task") or "").strip() or user_text
-    ident = _resolve_flight_ident(state)
+    try:
+        user_text = _latest_user_text(state) or "current flight operations"
+        task = _task_for_spoke(state, "flightaware") or user_text
+        ident = _resolve_flight_ident(state)
 
-    # Only hit FlightAware when we actually know which flight/tail
-    if ident:
-        fa_result = flightaware_live_status.invoke({"ident": ident})
-    else:
-        fa_result = (
-            '{"source":"skipped","note":"No flight number or tail found in '
-            'current_task, latest message, Spoke_3 notes, or (for follow-ups) '
-            'prior chat."}'
+        if ident:
+            fa_result = flightaware_live_status.invoke({"ident": ident})
+        else:
+            fa_result = (
+                '{"source":"skipped","note":"No flight number or tail found in '
+                "current_task, latest message, Tavily notes, or (for follow-ups) "
+                'prior chat."}'
+            )
+
+        content = (
+            f"[Spoke_2_LiveOps]\n"
+            f"Resolved ident from conversation: {ident or 'NONE'}\n"
+            f"Current task: {task}\n"
+            f"Latest user text: {user_text}\n"
+            f"FlightAware ({ident or 'skipped'}):\n{fa_result}"
         )
-
-    content = (
-        f"[Spoke_2_LiveOps]\n"
-        f"Resolved ident from conversation: {ident or 'NONE'}\n"
-        f"Current task: {task}\n"
-        f"Latest user text: {user_text}\n"
-        f"FlightAware ({ident or 'skipped'}):\n{fa_result}"
-    )
-    # Return to supervisor so Plan-and-Execute can pop the next plan step (or FINISH).
-    return {"turn_notes": [content]}
+        return {"turn_notes": [_spoke_note("flightaware", content)]}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("FlightAware spoke failed; returning error note.")
+        return {
+            "turn_notes": [
+                _spoke_note("flightaware", f"[flightaware] error: {exc}")
+            ]
+        }
 
 
 def spoke_3_websearch_node(state: AgentState) -> dict:
-    """Specialist 3: Tavily aviation web research (decoupled from LiveOps).
+    """Specialist 3: Tavily aviation web research / NOTAMs.
 
-    Fast path (0 LLM): first spoke this turn → search `current_task` as-is.
-    Chained path (1 spoke_llm): refine query using prior spoke tool outputs.
+    Parallel fan-out typically takes the fast path (supervisor task as-is).
+    If sibling notes are already in this Send copy, optionally refine once.
     """
-    # Prefer supervisor's hop-local `current_task`; fall back to the latest user ask.
-    user_text = _latest_user_text(state) or ""
-    task_query = str(state.get("current_task") or "").strip() or user_text
-    if not task_query:
-        task_query = "aviation operations"
+    try:
+        user_text = _latest_user_text(state) or ""
+        task_query = _task_for_spoke(state, "tavily") or user_text or "aviation operations"
 
-    # Did any spoke already write tool output THIS turn?
-    # startswith(tuple) matches notes beginning with any of these prefixes.
-    # Example: LiveOps ran first → we may refine Tavily using the FA ident it found.
-    prior_spoke_outputs = [
-        n
-        for n in (state.get("turn_notes") or [])
-        if str(n).startswith(("[Spoke_1", "[Spoke_2", "[Spoke_3"))
-    ]
+        prior_spoke_outputs = [
+            _note_content(n)
+            for n in (state.get("turn_notes") or [])
+            if _note_spoke(n) in VALID_FANOUT_SPOKES
+        ]
 
-    # Default = fast path: use the supervisor task string unchanged (0 LLM calls).
-    final_query = task_query
-    refine_source = "task_direct"  # logged into turn_notes for metro / debugging
+        final_query = task_query
+        refine_source = "task_direct"
 
-    if prior_spoke_outputs:
-        # Chained path: something already ran (OpenSky / LiveOps / earlier WebSearch).
-        # One Gemini call can fold concrete facts into a sharper Tavily query.
-        model = get_spoke_llm()
-        if model is not None:
-            try:
-                # Cap size: last 4 spoke notes, each truncated, so the refine prompt stays small.
-                prior_blob = "\n\n".join(str(n)[:1200] for n in prior_spoke_outputs[-4:])
-                # Force shape {"refined_query": "..."} via WebSearchRefine (same idea as PlannedStep).
-                structured = model.with_structured_output(WebSearchRefine)
-                refined = structured.invoke(
-                    [
-                        SystemMessage(
-                            content=(
-                                "You refine a Tavily web-search query for aviation research.\n"
-                                "Use concrete facts from prior spoke outputs "
-                                "(flight numbers, aircraft types, tail regs, airports) "
-                                "to sharpen the query. Do not repeat prior queries verbatim. "
-                                "Keep the refined query short and searchable."
-                            )
-                        ),
-                        HumanMessage(
-                            content=(
-                                f"Original task query:\n{task_query}\n\n"
-                                f"Prior spoke outputs:\n{prior_blob}\n\n"
-                                "Return a refined_query string."
-                            )
-                        ),
-                    ]
-                )
-                # Some model wrappers return a dict instead of a Pydantic instance.
-                if isinstance(refined, dict):
-                    refined = WebSearchRefine.model_validate(refined)
-                candidate = str(getattr(refined, "refined_query", "") or "").strip()
-                if candidate:
-                    final_query = candidate
-                    refine_source = "llm_chained"
-            except Exception:  # noqa: BLE001
-                # Soft-fail: web search still runs with the original task_query.
-                logger.exception(
-                    "Spoke_3 query refine failed; using task_query unchanged."
-                )
-                refine_source = "task_fallback"
+        if prior_spoke_outputs:
+            model = get_spoke_llm()
+            if model is not None:
+                try:
+                    prior_blob = "\n\n".join(str(n)[:1200] for n in prior_spoke_outputs[-4:])
+                    structured = model.with_structured_output(WebSearchRefine)
+                    refined = structured.invoke(
+                        [
+                            SystemMessage(
+                                content=(
+                                    "You refine a Tavily web-search query for aviation research.\n"
+                                    "Use concrete facts from prior spoke outputs "
+                                    "(flight numbers, aircraft types, tail regs, airports) "
+                                    "to sharpen the query. Do not repeat prior queries verbatim. "
+                                    "Keep the refined query short and searchable."
+                                )
+                            ),
+                            HumanMessage(
+                                content=(
+                                    f"Original task query:\n{task_query}\n\n"
+                                    f"Prior spoke outputs:\n{prior_blob}\n\n"
+                                    "Return a refined_query string."
+                                )
+                            ),
+                        ]
+                    )
+                    if isinstance(refined, dict):
+                        refined = WebSearchRefine.model_validate(refined)
+                    candidate = str(getattr(refined, "refined_query", "") or "").strip()
+                    if candidate:
+                        final_query = candidate
+                        refine_source = "llm_chained"
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Tavily query refine failed; using task_query unchanged."
+                    )
+                    refine_source = "task_fallback"
 
-    # Always hit Tavily (mock path inside the tool if TAVILY_API_KEY is missing).
-    tv_result = tavily_aviation_web_search.invoke({"query": final_query})
-
-    # Prefix matters: Spoke 2's _resolve_flight_ident scans "[Spoke_3_WebSearch]"
-    # notes to pick up flight numbers discovered by web research.
-    content = (
-        f"[Spoke_3_WebSearch] Query: {final_query}\n"
-        f"Refine: {refine_source}\n"
-        f"{tv_result}"
-    )
-    # Scratch only — supervisor pops the next plan step (or FINISH) on the next hop.
-    return {"turn_notes": [content]}
+        tv_result = tavily_aviation_web_search.invoke({"query": final_query})
+        content = (
+            f"[Spoke_3_WebSearch] Query: {final_query}\n"
+            f"Refine: {refine_source}\n"
+            f"{tv_result}"
+        )
+        return {"turn_notes": [_spoke_note("tavily", content)]}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Tavily spoke failed; returning error note.")
+        return {
+            "turn_notes": [_spoke_note("tavily", f"[tavily] error: {exc}")]
+        }
 
 
 def synthesizer_node(state: AgentState) -> dict:
-    """Writer node: turn this turn's scratch notes into one final chat answer.
+    """Writer node: reorder fan-in notes, then synthesize one final chat answer.
 
-    REVIEW: now receives recent conversation + resolved flight/tail so
-    follow-up answers stay about AI8303 (etc.), not a lost identifier.
-    Also stronger rules around FlightAware headline / codeshares / mocks.
-    Always appends a durable OpenSky vector block when Spoke 1 returned states,
-    so follow-up turns can re-read callsign / icao24 from messages.
+    Reads `turn_notes` + sanitized `context_priority_order`, packs a markdown
+    string in that sequence, and hands it to the synthesis LLM.
     """
-    chunks: list[str] = [str(note) for note in (state.get("turn_notes") or [])]
-    history = _conversation_texts(state, limit=6)  # REVIEW: chat context
-    resolved = _resolve_flight_ident(state)  # REVIEW: bind pronouns to a flight
+    raw_notes = list(state.get("turn_notes") or [])
+    priority = _sanitize_context_priority_order(
+        state.get("context_priority_order")
+    )
+    ordered_notes = _reorder_turn_notes(raw_notes, priority)
+    packed_markdown = _format_notes_markdown(ordered_notes) # turns the sorted notes into a markdown string to feed to the LLM
+    chunks: list[str] = [ # this is the list of notes that will be fed to the LLM
+        _note_content(note) for note in ordered_notes if _note_content(note).strip()
+    ]
+    history = _conversation_texts(state, limit=MESSAGE_WINDOW)
+    resolved = _resolve_flight_ident(state)
     opensky_block = _format_opensky_durable_block(chunks)
 
     model = get_spoke_llm()
-    if model is not None and chunks:
+    if model is not None and packed_markdown:
         try:
             response = model.invoke(
                 [
@@ -1296,8 +1573,11 @@ def synthesizer_node(state: AgentState) -> dict:
                         content=(
                             "Synthesize a concise aviation intelligence report "
                             "from supervisor and spoke outputs.\n"
+                            "Notes are packed in context_priority_order (safety-critical "
+                            "FlightAware, which may include NOAA METARs on delay, and "
+                            "Tavily NOTAMs sit at an edge — treat those sections as "
+                            "high-priority).\n"
                             "Rules:\n"
-                            # REVIEW: follow-up + codeshare + empty-SQLite rules
                             "- Use recent conversation context for follow-up questions "
                             "(pronouns like 'this flight', '2 months from now').\n"
                             f"- Active flight/tail in this conversation: {resolved or 'unknown'}.\n"
@@ -1320,7 +1600,7 @@ def synthesizer_node(state: AgentState) -> dict:
                             "exact tail is assigned close to departure.\n"
                             "- Lead with status, aircraft, route, and times when relevant.\n"
                             "- NEVER paste raw turn_notes, JSON blobs, or '[Spoke_…]' / "
-                            "'[supervisor]' lines. Write a clean passenger-facing answer.\n"
+                            "'[supervisor]' / markdown headers. Write a clean passenger-facing answer.\n"
                             "- If FlightAware returned empty/error for a bad ident (e.g. N1) "
                             "but Tavily named real flights (e.g. EK568/EK569), trust Tavily "
                             "for the flight numbers and say live status was unavailable."
@@ -1328,17 +1608,15 @@ def synthesizer_node(state: AgentState) -> dict:
                     ),
                     HumanMessage(
                         content=(
-                            # REVIEW: pass chat history into synthesis, not notes-only
                             "Recent conversation:\n"
                             + ("\n---\n".join(history) if history else "(none)")
-                            + "\n\nSpoke / supervisor notes:\n"
-                            + "\n\n".join(chunks[-8:])
+                            + "\n\nSpoke / supervisor notes (priority-packed):\n"
+                            + packed_markdown
                         )
                     ),
                 ]
             )
             final_report = _llm_text(response)
-            # If the model echoes scratch instead of synthesizing, use fallback.
             if (
                 not final_report.strip()
                 or final_report.lstrip().startswith(("[Spoke_", "[supervisor]"))
@@ -1395,7 +1673,11 @@ def _extract_json_blobs_from_text(text: str) -> list[Any]:
 def _format_opensky_durable_block(chunks: list[str]) -> str | None:
     """Build a fixed OpenSky summary for messages (follow-up / regex friendly)."""
     joined = "\n".join(chunks)
-    if "[Spoke_1_OpenSky]" not in joined:
+    if (
+        "[Spoke_1_OpenSky]" not in joined
+        and "OpenSky result:" not in joined
+        and "[opensky]" not in joined.lower()
+    ):
         return None
 
     state: dict[str, Any] | None = None
@@ -1478,9 +1760,10 @@ def _fallback_report(chunks: list[str]) -> str:
     # Prefer airline idents discovered in web notes over dumping raw JSON.
     web_idents: list[str] = []
     for note in chunks:
-        if str(note).startswith("[Spoke_3_WebSearch]"):
+        blob = str(note)
+        if blob.startswith("[Spoke_3_WebSearch]") or blob.startswith("[tavily]"):
             # Collect a few distinct flight numbers from the Tavily payload text.
-            text = _normalize_ident_text(str(note))
+            text = _normalize_ident_text(blob)
             for match in re.finditer(r"\b([A-Z]{2,3}\d{1,5})\b", text):
                 cand = match.group(1)
                 if cand in _FLIGHT_IDENT_STOPWORDS or cand in web_idents:
@@ -1506,7 +1789,7 @@ def _fallback_report(chunks: list[str]) -> str:
         useful = [
             str(c)
             for c in chunks[-4:]
-            if str(c).startswith(("[Spoke_1", "[Spoke_2", "[Spoke_3"))
+            if str(c).startswith(("[Spoke_1", "[Spoke_2", "[Spoke_3", "[opensky", "[flightaware", "[tavily"))
         ]
         body = "\n\n".join(useful) if useful else "\n\n".join(str(c) for c in chunks[-3:])
         if len(body) > 1800:
