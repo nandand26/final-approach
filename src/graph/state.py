@@ -20,12 +20,22 @@ MESSAGE_WINDOW = 20
 # Fan-out spoke ids used by Send() and context_priority_order.
 VALID_FANOUT_SPOKES = ("opensky", "flightaware", "tavily")
 
-# Per-spoke hard caps for a single user-message turn (one hop each in fan-out).
+# Per-spoke caps for a single user-message turn. Counted against DISTINCT tasks
+# per spoke (see task_key), not against how many times a spoke name appears.
 SPOKE_CAPS = {
     "opensky": 2,
     "flightaware": 2,
-    "tavily": 2,
+    "tavily": 5,
 }
+
+
+def task_key(task: str) -> str:
+    """Comparison key for a spoke task: lowercase, trim, collapse whitespace.
+
+    Used ONLY to spot duplicate calls and count distinct tasks. Never store or
+    send this value. The spoke receives the original task text from the plan.
+    """
+    return " ".join(str(task or "").lower().split())
 
 WORKER_TO_FANOUT = {
     "opensky": "opensky",
@@ -89,8 +99,9 @@ class AgentState(TypedDict):
     # (app.py passes turn_notes=[] each prompt). Do not drop that reset.
     turn_notes: Annotated[list[dict], merge_turn_notes]
 
-    # One {worker, task} per spoke in spokes_to_call. The router still fans out
-    # from spokes_to_call; each spoke reads its own task from this list.
+    # One {worker, task} row per spoke CALL. The same worker may appear more than
+    # once with different tasks. The router sends one Send per row and puts that
+    # row's task in the Send payload under "task".
     plan: list[dict[str, str]]
 
     # Route class for this supervisor visit:
@@ -104,7 +115,8 @@ class AgentState(TypedDict):
     # Tavily query for discovery or general research. Not a chat transcript field.
     search_query: str | None
 
-    # Fan-out targets (graph node names): opensky | flightaware | tavily
+    # Distinct spoke ids in the plan (graph node names), each listed once:
+    # opensky | flightaware | tavily
     spokes_to_call: list[str]
 
     # Synthesizer pack order (may differ from execution order).

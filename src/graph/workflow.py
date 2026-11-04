@@ -1,9 +1,11 @@
 """LangGraph router.
 
-Path 1 (telemetry_known): Send() the spokes the supervisor chose, in parallel.
-Path 2 (telemetry_discovery): tavily → clarification_node interrupt →
-Command(goto="supervisor"). No static edge off clarification_node.
-Path 3a (general_knowledge): tavily, then synthesizer.
+Path 1 (telemetry_known): one Send() per plan row, in parallel. The same spoke
+may run more than once with different tasks. Each Send carries its own task.
+Path 2 (telemetry_discovery): one Send() per Tavily plan row, then
+clarification_node interrupt → Command(goto="supervisor"). No static edge
+off clarification_node.
+Path 3a (general_knowledge): one Send() per Tavily plan row, then synthesizer.
 Path 3b (direct_chat): synthesizer. No tools.
 """
 
@@ -32,21 +34,34 @@ CHECKPOINT_DB_PATH = _PROJECT_ROOT / "checkpoints.db"
 
 
 def _route_after_supervisor(state: AgentState):
-    """Intent → one node, a Send list, or the synthesizer."""
+    """Intent → a Send list, or the synthesizer.
+
+    Discovery and general research already stored a Tavily-only plan, so the
+    sends stay Tavily-only. After those calls finish, _route_after_tavily
+    sends discovery to clarification and research to the synthesizer. A
+    greeting goes straight to the synthesizer.
+    """
     intent = str(state.get("intent") or "")
     spokes = [
         spoke
         for spoke in list(state.get("spokes_to_call") or [])
         if spoke in VALID_FANOUT_SPOKES
     ]
-    if intent == "telemetry_discovery":
-        return "tavily"
-    if intent == "general_knowledge":
-        return "tavily"
     if intent == "direct_chat" or not spokes:
         return "synthesizer"
-    # telemetry_known: every spoke the supervisor selected, in one parallel step.
-    return [Send(spoke, state) for spoke in spokes]
+    # The supervisor already applied the cap, dropped duplicate tasks, and
+    # kept only spokes_to_call. One Send per remaining plan row. The row's
+    # task rides in the payload so two calls to the same spoke stay distinct.
+    sends: list[Send] = []
+    for step in list(state.get("plan") or []):
+        if not isinstance(step, dict):
+            continue
+        worker = str(step.get("worker") or "").strip()
+        task = str(step.get("task") or "").strip()
+        if not worker or not task:
+            continue
+        sends.append(Send(worker, {**state, "task": task}))
+    return sends
 
 
 def _route_after_tavily(state: AgentState) -> str:

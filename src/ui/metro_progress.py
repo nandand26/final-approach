@@ -975,6 +975,11 @@ def _complete_spoke(progress: TurnProgress, worker: str, notes: list[str]) -> No
         _activate_next_from_plan(progress)
         return
 
+    # The strip has one station per spoke. A spoke can now run twice with
+    # different tasks, so remember what the first call left on this station.
+    prev_status = station.status
+    prev_detail = station.detail_md
+
     if worker in {"opensky", "Spoke_1_OpenSky"}:
         detail = format_spoke1_card(joined)
         metrics = extract_spoke1_metrics(joined)
@@ -1026,6 +1031,14 @@ def _complete_spoke(progress: TurnProgress, worker: str, notes: list[str]) -> No
             progress,
             f"{station.label}: {'⚠️ ' if warn else ''}{station.summary}",
         )
+
+    # Second finished call for the same spoke: keep the first card and add the
+    # new one under it, and do not let a later success erase an earlier warning.
+    if prev_status in {"done", "warn"}:
+        if prev_detail:
+            station.detail_md = f"{prev_detail}\n\n---\n\n{station.detail_md or ''}"
+        if prev_status == "warn":
+            station.status = "warn"
 
     _activate_next_from_plan(progress)
 

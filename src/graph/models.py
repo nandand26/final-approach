@@ -96,7 +96,7 @@ spoke_llm = get_spoke_llm()
 
 
 class PlannedStep(BaseModel):
-    """One spoke the router scheduled, plus the exact text that spoke must run."""
+    """One spoke CALL the router scheduled, plus the exact text that call must run."""
 
     worker: Literal["opensky", "flightaware", "tavily"] = Field(
         description="Fan-out spoke id (graph node name).",
@@ -163,7 +163,9 @@ class SupervisorPlan(BaseModel):
         default_factory=list,
         description=(
             "Domain spokes to execute IN PARALLEL. Allowed: "
-            f"{list(VALID_FANOUT_SPOKES)}. Caps: { {k: SPOKE_CAPS[k] for k in VALID_FANOUT_SPOKES} }. "
+            f"{list(VALID_FANOUT_SPOKES)}. List each spoke once; repeat calls "
+            "to a spoke go in `plan`. Caps on distinct tasks per spoke: "
+            f"{ {k: SPOKE_CAPS[k] for k in VALID_FANOUT_SPOKES} }. "
             "telemetry_known: any subset of opensky, flightaware, tavily that "
             "this question needs. Those spokes run in parallel. "
             "telemetry_discovery MUST be exactly ['tavily']. "
@@ -220,10 +222,14 @@ class SupervisorPlan(BaseModel):
     plan: list[PlannedStep] = Field(
         default_factory=list,
         description=(
-            "Required execution contract. Exactly one {worker, task} for every "
-            "id in spokes_to_call, and no other workers. task must be non-empty. "
-            "Validation fails if a selected spoke has no row, a row is duplicated, "
-            "or a row names a spoke that was not selected. "
+            "Required execution contract. One {worker, task} row per spoke CALL. "
+            "Every id in spokes_to_call needs at least one row, and no row may "
+            "name a spoke that was not selected. task must be non-empty. "
+            "The same worker may appear more than once ONLY with genuinely "
+            "different tasks, up to the per-spoke cap. NEVER repeat an identical "
+            "task for the same worker. "
+            "Validation fails if a selected spoke has no row or a row names a "
+            "spoke that was not selected. "
             "Empty only when spokes_to_call is empty (direct_chat)."
         ),
     )
@@ -258,19 +264,16 @@ class SupervisorPlan(BaseModel):
 
     @model_validator(mode="after")
     def _align_plan_to_spokes(self) -> SupervisorPlan:
-        """Require plan workers to equal spokes_to_call, one row each.
+        """Require the plan's workers to equal the spokes in spokes_to_call.
 
-        Runs after both fields are parsed. A missing spoke, an extra spoke,
-        or a duplicate worker raises. Blank tasks never reach here: PlannedStep
+        Runs after both fields are parsed. A selected spoke with no row, or a
+        row for a spoke that was not selected, raises. The same worker may have
+        several rows (different tasks); exact duplicates and the per-spoke cap
+        are handled in nodes.py. Blank tasks never reach here: PlannedStep
         already rejects them.
         """
         selected = list(dict.fromkeys(self.spokes_to_call))
         workers = [step.worker for step in self.plan]
-        if len(workers) != len(set(workers)):
-            raise ValueError(
-                "plan has a duplicate worker. "
-                "Exactly one {worker, task} is required per spokes_to_call id."
-            )
         if set(workers) != set(selected):
             missing = [name for name in selected if name not in workers]
             extra = [name for name in workers if name not in set(selected)]

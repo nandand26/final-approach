@@ -29,6 +29,7 @@ from src.graph.state import (
     VALID_FANOUT_SPOKES,
     WORKER_TO_FANOUT,
     AgentState,
+    task_key, # Task key is a unique identifier for a task. It is used to identify the task and to avoid duplicate tasks.
 )
 from src.graph.models import (
     SupervisorPlan,
@@ -324,23 +325,30 @@ def _enforce_spoke_caps(
     plan: list[Any],
     already_ran: dict[str, int] | None = None,
 ) -> list[dict[str, str]]:
-    """Defensive queue sanitizer: valid spokes only + per-worker SPOKE_CAPS.
+    """Defensive plan sanitizer: valid spokes, no duplicate calls, per-worker caps.
 
-    WHY this exists on top of the LLM schema prompt:
-    - LLMs can still emit duplicates or invalid names.
-    - Mid-turn re-entry must also respect how many times a spoke already executed.
-    - Caps are counted against (already_ran + scheduled-in-this-plan).
+    A row is one spoke call. Identity is (worker, task_key(task)):
+    - An exact duplicate of an earlier row is dropped. The FIRST row is kept
+      exactly as written. task_key is only a comparison key; it is never stored.
+    - SPOKE_CAPS counts DISTINCT tasks per worker (plus already_ran). Different
+      tasks for the same worker are all kept, up to the cap, in plan order.
+    - LLMs can still emit duplicates, invalid names, or too many calls.
     """
     already_ran = already_ran or _empty_spoke_counts()
     scheduled = _empty_spoke_counts()
+    seen: set[tuple[str, str]] = set()
     cleaned: list[dict[str, str]] = []
 
     for step in _normalize_plan_steps(plan):
         worker = step["worker"]
+        call = (worker, task_key(step["task"]))
+        if call in seen:
+            continue
         cap = SPOKE_CAPS.get(worker, 0)
         total_if_added = already_ran.get(worker, 0) + scheduled.get(worker, 0) + 1
         if total_if_added > cap:
             continue
+        seen.add(call)
         cleaned.append(step)
         scheduled[worker] = scheduled.get(worker, 0) + 1
 
@@ -585,20 +593,25 @@ def _plan_from_spokes(
     flight_number: str | None = None,
     search_query: str | None = None,
 ) -> list[dict[str, str]]:
-    """One {worker, task} row for every spoke the router will Send.
+    """One {worker, task} row for every spoke CALL the router will Send.
 
-    Review: the supervisor's own task wins. A selected spoke with no task
-    gets a spoke-specific fallback:
-    FlightAware gets the ident, Tavily gets the search query, OpenSky gets
-    the user question. The returned list is what state["plan"] stores.
+    Review: the supervisor's own rows win, in plan order. The same worker may
+    appear more than once with different tasks. Exact duplicates and the cap
+    are already applied by _enforce_spoke_caps before this runs. A selected
+    spoke that has no row at all gets one fallback row: FlightAware gets the
+    ident, Tavily gets the search query, OpenSky gets the user question. The
+    returned list is what state["plan"] stores.
     """
-    tasks: dict[str, str] = {}
+    wanted = _unique_fanout(spokes)
+    rows: list[dict[str, str]] = []
     for step in plan_steps or []:
         worker = WORKER_TO_FANOUT.get(step.get("worker", ""), step.get("worker", ""))
         task = str(step.get("task") or "").strip()
-        # Skip a row with an unknown worker or a blank task. The fallback below fills it.
-        if worker in VALID_FANOUT_SPOKES and task:
-            tasks[worker] = task
+        # Skip a row for a spoke that is not being sent, or a blank task.
+        # The fallback below fills a spoke that ends up with no row.
+        if worker not in wanted or not task:
+            continue
+        rows.append({"worker": worker, "task": task})
 
     ident = (flight_number or "").strip()
     query = (search_query or "").strip()
@@ -611,19 +624,24 @@ def _plan_from_spokes(
             return query
         return fallback
 
-    return [
-        {"worker": spoke, "task": tasks.get(spoke) or _default_task(spoke)}
-        for spoke in _unique_fanout(spokes)
-    ]
+    have = {row["worker"] for row in rows}
+    for spoke in wanted:
+        if spoke not in have:
+            rows.append({"worker": spoke, "task": _default_task(spoke)})
+    return rows
 
 
 def _task_for_spoke(state: AgentState, spoke: str) -> str:
-    """Task string for one spoke that Send is about to run.
+    """Task string for the spoke call that is running now.
 
-    Review: lookup order is that spoke's plan row, then current_task, then
-    the latest user message. OpenSky, FlightAware, and Tavily all call this.
-    Fan-in does not.
+    Review: lookup order is the Send payload's own "task" (the router puts the
+    plan row's task there), then that spoke's first plan row, then current_task,
+    then the latest user message. OpenSky, FlightAware, and Tavily all call
+    this. Fan-in does not, and it has no payload task.
     """
+    sent = str(state.get("task") or "").strip()
+    if sent:
+        return sent
     for step in _normalize_plan_steps(state.get("plan") or []):
         if step.get("worker") == spoke and step.get("task"):
             return str(step["task"])
@@ -805,16 +823,23 @@ def _llm_generate_plan(
         "- flightaware = AeroAPI status. NOAA METARs run INSIDE this spoke only "
         "on delay/hold/divert. Requires a flight ident.\n"
         "- tavily = web research, NOTAMs, and flight-number discovery.\n\n"
-        "PLAN (`plan`) — required, one row per spoke in spokes_to_call:\n"
-        "- worker is the spoke id. task is the exact text that spoke must run.\n"
+        "PLAN (`plan`) — required, one row per spoke CALL:\n"
+        "- worker is the spoke id. task is the exact text that call must run.\n"
         "- flightaware task = the flight ident only (BA117).\n"
         "- opensky task = the icao24 hex or airport ICAO question.\n"
         "- tavily task = the web, NOTAM, or discovery query.\n"
-        "- spokes_to_call and plan workers must be the same set. "
-        "Do not omit plan when spokes_to_call is non-empty.\n\n"
+        "- List each spoke once in spokes_to_call. Every spoke in spokes_to_call "
+        "needs at least one plan row, and plan rows may use only those spokes. "
+        "Do not omit plan when spokes_to_call is non-empty.\n"
+        "- You may plan more than one call to the same spoke ONLY when the tasks "
+        "are genuinely different (for example flightaware BA117 and flightaware "
+        "BA118), up to the cap. NEVER repeat an identical task for the same spoke.\n"
+        "- telemetry_discovery and general_knowledge stay Tavily only. Several "
+        "tavily rows are allowed when the tasks differ, up to the cap. Never add "
+        "opensky or flightaware on those intents.\n\n"
         "Also return flight_number (ident or null) and search_query "
         "(Tavily string, or null when Tavily is not selected).\n"
-        f"At most one of each spoke ({ {k: SPOKE_CAPS[k] for k in VALID_FANOUT_SPOKES} }).\n"
+        f"Cap on DISTINCT tasks per spoke ({ {k: SPOKE_CAPS[k] for k in VALID_FANOUT_SPOKES} }).\n"
         "NEVER emit noaa, FINISH, or synthesizer as a spoke.\n\n"
         "CONTEXT PRIORITY ORDER (pack order, not execution order):\n"
         "- If flightaware and/or tavily are selected, put them at the absolute "
@@ -837,7 +862,7 @@ def _llm_generate_plan(
                         f"{history_blob or '(none)'}\n\n"
                         f"Latest user query:\n{user_text}\n\n"
                         "Return a SupervisorPlan with intent, flight_number, search_query, "
-                        "spokes_to_call, plan (one {worker, task} per spoke), "
+                        "spokes_to_call, plan (one {worker, task} per spoke call), "
                         "context_priority_order, and extract_memory."
                     )
                 ),
@@ -1393,11 +1418,19 @@ def _resolve_flight_ident(state: AgentState) -> str | None:
     """Resolve flight/tail with priority that avoids cross-turn regex bleed.
 
     Order:
+      0) This Send call's own task, when it contains an ident. Two FlightAware
+         calls for different flights must not both fall back to `flight_number`.
       1) Supervisor `flight_number` (typed by the user or chosen at clarification)
       2) `current_task` + latest user message
       3) Tavily notes from this turn (usually empty under parallel Send)
       4) Prior messages only when the latest prompt has explicit follow-up phrases
     """
+    sent = str(state.get("task") or "").strip()
+    if sent:
+        found_in_task = _find_ident_in_text(sent)
+        if found_in_task:
+            return found_in_task
+
     explicit = str(state.get("flight_number") or "").strip()
     if explicit:
         return _find_ident_in_text(explicit) or explicit.upper()
