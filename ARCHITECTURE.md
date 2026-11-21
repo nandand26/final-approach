@@ -21,6 +21,7 @@ A logged-in user asks something like “What’s the status of BA117?” or “L
 13. [Models](#13-models)
 14. [Code map](#14-code-map)
 15. [Limits](#15-limits)
+16. [Evaluation: supervisor routing](#16-evaluation-supervisor-routing)
 
 ## 1) Domain split
 
@@ -200,7 +201,7 @@ Search runs at the start of every supervisor visit. It embeds the query. It is n
 
 Live traces use `run_name="Aviation_Ops_Turn"`, tags for entrypoint and user, and `recursion_limit=10`. FlightAware tool traces hide the API key. If a valid key gets HTTP 403, the usual cause is the wrong regional endpoint.
 
-Routing eval is separate from those live traces. `scripts/create_langsmith_dataset.py` uploads `FinalApproach_Routing_Eval_v2`. `scripts/evaluate_routing.py` calls `supervisor_node` only and scores `intent`, `spokes_to_call`, and `extract_memory`. It does not run the graph, the spokes, or the synthesizer. Dataset `history` is hand-written prior chat, not a replay of `checkpoints.db`.
+Routing eval is separate from those live traces. `scripts/create_langsmith_dataset.py` uploads `FinalApproach_Routing_Eval_v2`. `scripts/evaluate_routing.py` calls `supervisor_node` only and scores `intent`, `spokes_to_call`, and `extract_memory`. It does not run the graph, the spokes, or the synthesizer. Dataset `history` is hand-written prior chat, not a replay of `checkpoints.db`. Results are in [section 16](#16-evaluation-supervisor-routing).
 
 ## 13) Models
 
@@ -248,3 +249,76 @@ aviation_agent/
 - NOAA text is a nearby METAR, not a proven cause of the delay.
 - The keyword planner is the fallback, not the live router.
 - The routing eval does not grade answer quality or Mem0 retrieval.
+
+## 16) Evaluation: supervisor routing
+
+- **What it does:** for one user message (and, in some cases, earlier chat), it checks whether the supervisor picks the right path, the right spokes, and the right memory-gate setting.
+- **What it does not do:** it does not run the spokes, call the live aviation APIs, or grade the written answer.
+
+### What is measured
+
+`scripts/evaluate_routing.py` builds the same fresh-turn state that `app.py` sends for a new prompt, calls `supervisor_node` once, and scores three fields of its output. Each check is pass or fail.
+
+| Check | Field | Passes when |
+|-------|-------|-------------|
+| Intent | `intent` | It equals the expected path exactly: `telemetry_known`, `telemetry_discovery`, `general_knowledge`, or `direct_chat` |
+| Spokes | `spokes_to_call` | Every spoke in the case's `must_include` list is present and no spoke in its `must_exclude` list is. Other spokes are allowed. Plan rows, tasks, idents, and caps are not checked |
+| Memory gate | `extract_memory` | It equals the expected true/false. True is expected only for an explicit, lasting preference |
+
+The eval runs with an empty `user_id`, so Mem0 search is skipped.
+
+**Pass criterion:** a case passes only when all three checks pass.
+
+### Results
+
+| Metric | Passed | Rate |
+|--------|--------|------|
+| **All three checks (joint)** | **45/51** | **88.2%** |
+| Intent | 50/51 | 98.0% |
+| Spokes | 47/51 | 92.2% |
+| Memory gate | 49/51 | 96.1% |
+
+By split: dev 8/8, test 37/43.
+
+LangSmith left the scores empty for 2 cases, "Hello there, how are you today?" and "Book me a ticket to London.". Their outputs (`direct_chat`, no spokes, `extract_memory` false) match the expected labels exactly, so they were graded from the exported outputs using the same rules as the eval script. Those rules reproduce every one of the 147 scores LangSmith did record. Counting only the scores LangSmith recorded, the result is 43/51 (84.3%).
+
+### Failures (6 of 51)
+
+| # | Query | Failed | Expected | Actual | Cause |
+|---|-------|--------|----------|--------|-------|
+| 1 | Always assume I am operating in a Linux environment when discussing software. | Memory | `direct_chat`, no spokes, memory **true** | `direct_chat`, no spokes, memory false | TBD |
+| 2 | Keep all future answers in tight dispatcher bullets. | Memory | `direct_chat`, no spokes, memory **true** | `direct_chat`, no spokes, memory false | TBD |
+| 3 | What is the UTC arrival time for the flight using the ILS approach? | Intent, spokes | `general_knowledge`, must include `tavily` | `direct_chat`, no spokes | TBD |
+| 4 | I need live radar for hex a1b2c3, the commercial status of AI8303, and the latest NOTAMs for DEL. | Spokes | `telemetry_known`, must include `opensky`, `flightaware`, `tavily` | `telemetry_known`, `flightaware` + `tavily` | TBD. A hex is in the message, so the OpenSky rule allows `opensky` here |
+| 5 | Pull live OpenSky radar for British Airways flight BA117. | Spokes | `telemetry_known`, must include `opensky`, `flightaware` | `telemetry_known`, `flightaware` only | The label conflicts with the supervisor prompt. The OpenSky rule in `nodes.py` sends a flight number to FlightAware only, even when the user asks for radar, unless a hex is given. Either the label or the rule has to change |
+| 6 | Is the radar track still showing it at 35,000 ft? (earlier chat: "Pull radar for 4cc2a3.") | Spokes | `telemetry_known`, must include `opensky` | `telemetry_known`, `flightaware` only | TBD. The hex is only in the earlier chat, and the OpenSky rule requires it "explicitly provided in the user's query" |
+
+### Provenance
+
+| Item | Value |
+|------|-------|
+| Results file | `Routing_Supervisor_Test-20d2bf97.csv`, a CSV export of the LangSmith experiment |
+| Dataset | `FinalApproach_Routing_Eval_v2`: the 51 cases in `scripts/create_langsmith_dataset.py` (8 dev, 43 test), 1 repetition |
+| Run date | 21 Nov 2026, about 19:46 IST. The CSV has no run timestamp. The dataset was uploaded at 19:45–19:46 IST and the CSV was exported at 19:48 IST |
+| Code version | LangSmith records `5b316e0-dirty`: commit `5b316e0` plus an uncommitted edit to `scripts/create_langsmith_dataset.py` (the case list). No application code was changed |
+| Supervisor model | OpenAI `gpt-4o-mini`, from `SUPERVISOR_MODEL` in the local `.env`. The CSV does not record the model name. Every case shows token usage, so the LLM ran, not the keyword fallback |
+| Cost and latency | About $0.012 in total, 1.9 s average per case, 2 cases at a time |
+
+To reproduce (needs `LANGCHAIN_API_KEY` and `OPENAI_API_KEY` in `.env`):
+
+```bash
+cd aviation_agent
+source .venv/bin/activate
+python scripts/create_langsmith_dataset.py   # deletes and re-creates the dataset from the case list
+python scripts/evaluate_routing.py
+```
+
+The model's output is not deterministic, so a rerun can differ by a case or two.
+
+### Limitations
+
+- 51 hand-written cases. The earlier chat in history cases is scripted, not taken from real sessions.
+- Routing only. There is no eval of answer quality, grounding, hallucination, or tool output yet.
+- The spokes check only tests which spokes are included or excluded. It does not check plan tasks, idents, per-spoke caps, or repeated calls to the same spoke.
+- One repetition, so there is no measure of run-to-run variance.
+- Mem0 retrieval is not exercised.

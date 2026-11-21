@@ -57,4 +57,6 @@ Sign in with Google, open a chat, and send a question. Threads stay on this mach
 
 `scripts/create_langsmith_dataset.py` uploads labeled supervisor cases to LangSmith. `scripts/evaluate_routing.py` runs the supervisor against that dataset and scores intent, spokes, and the memory gate. That checks routing only. It does not call the live aviation APIs or grade the written answer.
 
+Latest routing eval (21 Nov 2026): **45/51 cases (88.2%) route fully correctly**, meaning intent, spokes, and memory gate are all right. LangSmith left 2 of those 51 cases unscored, so they were graded from their exported outputs using the same rules. Results, failures, and how to rerun it are in [ARCHITECTURE.md](ARCHITECTURE.md#16-evaluation-supervisor-routing).
+
 Personal project. Not affiliated with FlightAware, OpenSky Network, NOAA, Google, OpenAI, Tavily, Mem0, or any airline.
