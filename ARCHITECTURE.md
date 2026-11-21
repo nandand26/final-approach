@@ -193,9 +193,15 @@ Two stores, two keys.
 | Store | Key | What it keeps |
 |-------|-----|----------------|
 | `checkpoints.db` | `thread_id` | Chat transcript and graph fields |
-| Mem0 under `~/.mem0` | Google `user_id` | Preferences |
+| Mem0 vector store in `mem0_store/` | Google `user_id` | Preferences |
 
 Search runs at the start of every supervisor visit. It embeds the query. It is not an LLM search. The helper keeps at most 3 facts. Add runs at the synthesizer only when the Memory Gate is open. Mem0 is imported lazily inside `nodes.py` so a missing install does not break boot. Search and add failures are swallowed and the turn still finishes.
+
+**Storage.** `_get_memory` sets Mem0's vector store to local Qdrant at `MEM0_VECTOR_PATH`, or `aviation_agent/mem0_store/` when that variable is empty. Before this was set, Mem0 used its default `/tmp/qdrant`, which macOS clears on reboot, so saved preferences were lost. Mem0 also writes a history log to `~/.mem0/history.db`. That log is not what search reads. `mem0_store/` is gitignored.
+
+- Local Qdrant loads the whole collection into memory when it opens and checks every stored vector on each search. That is fine for one user's preferences. A server vector store, such as Qdrant server or pgvector, is the step up.
+- Local Qdrant locks the folder. Only one process can use it. Several browser tabs on one Streamlit app are fine. A second `streamlit run` on the same folder fails to open Mem0 and, because Mem0 errors are swallowed, runs without memory.
+- In the installed Mem0 (2.1), `add` only adds. It embeds the turn, fetches the 10 closest existing memories for that `user_id`, asks the LLM in one call for new facts given those, drops exact duplicates by hash, and inserts the rest. It does not update or delete an older memory, so a changed preference ("meters", later "feet") leaves both facts stored.
 
 ## 12) LangSmith
 

@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -69,6 +70,10 @@ _FOLLOWUP_IDENT_RE = re.compile(
 _memory_client: Any | None = None
 _memory_init_attempted = False
 
+# Durable home for Mem0's vector store, next to checkpoints.db and auth_sessions.db.
+# Without an explicit path Mem0 falls back to /tmp/qdrant, which macOS wipes on reboot.
+_MEM0_DEFAULT_PATH = Path(__file__).resolve().parents[2] / "mem0_store"
+
 
 def _get_memory() -> Any | None:
     """Return a local mem0.Memory() instance, or None if unavailable.
@@ -76,6 +81,9 @@ def _get_memory() -> Any | None:
     Mem0 OSS defaults to `gpt-5-mini` with temperature=0.1, but that model
     rejects non-default temperature (OpenAI 400). Pin a chat model that
     accepts 0.1 — prefer MEM0_LLM_MODEL, else SUPERVISOR_MODEL, else gpt-4o-mini.
+
+    Storage: local Qdrant at MEM0_VECTOR_PATH, else aviation_agent/mem0_store/.
+    Local Qdrant locks that folder, so only one app process can use it at a time.
     """
     global _memory_client, _memory_init_attempted
     if _memory_client is not None:
@@ -91,6 +99,8 @@ def _get_memory() -> Any | None:
             or (os.getenv("SUPERVISOR_MODEL") or "").strip()
             or "gpt-4o-mini"
         )
+        # Env var first (e.g. a mounted volume in Docker), else the project folder.
+        mem0_path = (os.getenv("MEM0_VECTOR_PATH") or "").strip() or str(_MEM0_DEFAULT_PATH)
         _memory_client = Memory.from_config(
             {
                 "llm": {
@@ -99,6 +109,10 @@ def _get_memory() -> Any | None:
                         "model": mem0_model,
                         "temperature": 0.1,
                     },
+                },
+                "vector_store": {
+                    "provider": "qdrant",
+                    "config": {"path": mem0_path},
                 },
             }
         )

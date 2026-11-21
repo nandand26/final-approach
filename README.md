@@ -11,7 +11,7 @@ It is a portfolio demo: real APIs, real Google login, local SQLite chat history.
 | Source | Used for |
 |--------|----------|
 | FlightAware | Live commercial status for a flight number or tail (BA117, 9V-SKQ) |
-| OpenSky | Live ADS-B when the question includes a 6-character icao24 hex, or an airport arrival/departure |
+| OpenSky | Live ADS-B when the question includes a 6-character icao24 hex |
 | Tavily | Web research, NOTAMs, and finding a flight number when the user did not give one |
 | NOAA | Weather, only inside FlightAware, and only when that flight is delayed, holding, or diverted |
 
@@ -29,6 +29,8 @@ pip install -r requirements.txt
 ```
 
 Copy `.env.example` to `.env` and fill in the keys you have. The usual ones are `OPENAI_API_KEY` (supervisor and Mem0), `GOOGLE_API_KEY` (spokes and the final answer), `FLIGHTAWARE_API_KEY`, `TAVILY_API_KEY`, and OpenSky `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`. Put the Streamlit Google login block in `.streamlit/secrets.toml`. Do not commit either file.
+
+If `FLIGHTAWARE_API_KEY` or `TAVILY_API_KEY` is missing, the app still runs, but that source returns built-in dummy data instead of live results, and the final answer may not say so. Set both keys before trusting an answer. Without OpenSky credentials, OpenSky falls back to anonymous access, which is still live but more rate-limited.
 
 ```bash
 streamlit run app.py
