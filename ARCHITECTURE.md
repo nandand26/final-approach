@@ -27,7 +27,7 @@ A logged-in user asks something like “What’s the status of BA117?” or “L
 
 | Spoke id | Handles | Does not handle |
 |----------|---------|-----------------|
-| `opensky` | A 6-character `icao24` hex, or airport arrivals/departures | Marketed flight numbers (BA117), tails (9V-SKQ), schedules, web research |
+| `opensky` | A 6-character `icao24` hex | Marketed flight numbers (BA117), tails (9V-SKQ), airport arrivals/departures without a hex, schedules, web research |
 | `flightaware` | Flight numbers and tails, AeroAPI status, codeshares | Web research. Radar without a commercial ident |
 | `tavily` | Web research, schedules, finding a flight number, NOTAMs | Live FlightAware status, OpenSky ADS-B |
 
@@ -165,6 +165,8 @@ Implementation: `src/mcp_servers/opensky_mcp.py`, planning in `nodes.py`.
 | `get_airport_departures` | Departures, window at most 7 days |
 | `get_aircraft_flight_history` | Legs for an `icao24`, window at most 30 days |
 | `get_aircraft_trajectory_track` | Track for an `icao24` |
+
+The airport arrival and departure tools exist in the spoke, but chat does not reach them in practice. The supervisor prompt only routes to OpenSky when a 6-character hex is in the message, so a question like "arrivals at EGLL" is not sent to OpenSky. The keyword fallback planner can still send airport questions there when the supervisor model is unavailable.
 
 If the text has no 6-character hex and no airport arrival or departure signal, planning skips Gemini and the spoke returns a soft error. Otherwise Gemini fills `OpenSkyToolPlan`, with a 20 second wall clock. The HTTP calls time out at 10 seconds. Auth prefers OAuth client credentials, then optional basic auth, then anonymous.
 
