@@ -150,7 +150,7 @@ Discovery calls Tavily, possibly several different queries. Gemini reads every T
 
 **FlightAware.** Resolves the ident from this call’s payload task, then `flight_number`, then the plan task, `current_task`, and the latest user message. Older messages are searched only when the latest prompt is a follow-up. A stopword list blocks acronym false hits (`MEL`, `UTC`, `ILS`). No LLM on this spoke.
 
-**Tavily.** Uses the payload task. The usual path calls Tavily with no extra LLM. A rare chained path may ask Gemini to refine the query when sibling notes are already present.
+**Tavily.** Uses the payload task as-is and calls Tavily. No LLM.
 
 **Synthesizer.** Gemini writes one answer. Notes are packed in `context_priority_order`. FlightAware and Tavily stay at an edge of that list so weather and NOTAMs are not buried in the middle. Every note for a spoke is grouped in that spoke’s one slot. The model must not invent a marketed flight number from a callsign, and an OpenSky miss is not “the flight does not exist”. Live OpenSky states are also stamped into the chat message. Mem0 `add` runs only when `extract_memory` is true.
 
@@ -219,7 +219,7 @@ Routing eval is separate from those live traces. `scripts/create_langsmith_datas
 | Mem0 add | OpenAI, optional `MEM0_LLM_MODEL` | Yes on add. Search embeds only |
 | OpenSky tool plan | Gemini `gemini-2.5-flash` by default | Only when a hex or an airport movement is present |
 | FlightAware and NOAA | — | No |
-| Tavily | — | No, except a rare query rewrite |
+| Tavily | — | No |
 | Synthesizer | Gemini | Yes |
 
 Getters in `src/graph/models.py` rebuild when `SUPERVISOR_MODEL` or `SPOKE_MODEL` changes.

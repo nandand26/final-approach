@@ -506,18 +506,6 @@ def _heuristic_plan(user_text: str, history_blob: str) -> list[dict[str, str]]:
     return _enforce_spoke_caps(plan)
 
 
-class WebSearchRefine(BaseModel):
-    """Structured refinement of a Tavily query using prior spoke facts."""
-
-    refined_query: str = Field(
-        description=(
-            "Short Tavily search query that incorporates concrete facts "
-            "(flight numbers, aircraft types, tails) from prior spoke outputs "
-            "without repeating prior queries verbatim."
-        ),
-    )
-
-
 def _heuristic_extract_memory(user_text: str) -> bool:
     """Offline Memory Gate when supervisor_llm is unavailable.
 
@@ -1531,64 +1519,15 @@ def spoke_2_liveops_node(state: AgentState) -> dict:
 def spoke_3_websearch_node(state: AgentState) -> dict:
     """Specialist 3: Tavily aviation web research / NOTAMs.
 
-    Parallel fan-out typically takes the fast path (supervisor task as-is).
-    If sibling notes are already in this Send copy, optionally refine once.
+    Runs the task from its Send payload as-is. No LLM call.
     """
     try:
         user_text = _latest_user_text(state) or ""
         task_query = _task_for_spoke(state, "tavily") or user_text or "aviation operations"
 
-        prior_spoke_outputs = [
-            _note_content(n)
-            for n in (state.get("turn_notes") or [])
-            if _note_spoke(n) in VALID_FANOUT_SPOKES
-        ]
-
-        final_query = task_query
-        refine_source = "task_direct"
-
-        if prior_spoke_outputs:
-            model = get_spoke_llm()
-            if model is not None:
-                try:
-                    prior_blob = "\n\n".join(str(n)[:1200] for n in prior_spoke_outputs[-4:])
-                    structured = model.with_structured_output(WebSearchRefine)
-                    refined = structured.invoke(
-                        [
-                            SystemMessage(
-                                content=(
-                                    "You refine a Tavily web-search query for aviation research.\n"
-                                    "Use concrete facts from prior spoke outputs "
-                                    "(flight numbers, aircraft types, tail regs, airports) "
-                                    "to sharpen the query. Do not repeat prior queries verbatim. "
-                                    "Keep the refined query short and searchable."
-                                )
-                            ),
-                            HumanMessage(
-                                content=(
-                                    f"Original task query:\n{task_query}\n\n"
-                                    f"Prior spoke outputs:\n{prior_blob}\n\n"
-                                    "Return a refined_query string."
-                                )
-                            ),
-                        ]
-                    )
-                    if isinstance(refined, dict):
-                        refined = WebSearchRefine.model_validate(refined)
-                    candidate = str(getattr(refined, "refined_query", "") or "").strip()
-                    if candidate:
-                        final_query = candidate
-                        refine_source = "llm_chained"
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Tavily query refine failed; using task_query unchanged."
-                    )
-                    refine_source = "task_fallback"
-
-        tv_result = tavily_aviation_web_search.invoke({"query": final_query})
+        tv_result = tavily_aviation_web_search.invoke({"query": task_query})
         content = (
-            f"[Spoke_3_WebSearch] Query: {final_query}\n"
-            f"Refine: {refine_source}\n"
+            f"[Spoke_3_WebSearch] Query: {task_query}\n"
             f"{tv_result}"
         )
         return {"turn_notes": [_spoke_note("tavily", content)]}
