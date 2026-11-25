@@ -1,0 +1,96 @@
+# RAG source manifest. One entry per file under data/raw/ (data/ is gitignored).
+# Dates are int YYYYMMDD. effective_to 99991231 = still in force.
+# Every entry has: verified (bool), derived_from ("" for originals, else source path
+# under data/raw/), text_layer (native | ocr | llm_transcription).
+
+sources:
+  - file: rights/dgca_car_m4_rev4.pdf
+    corpus: rights
+    title: "CAR Section 3 Series M Part IV: Facilities to be provided to passengers by airlines due to denied boarding, cancellation of flights and delays in flights"
+    jurisdiction: IN
+    regulator: DGCA
+    authority: regulator
+    version: "Rev. 4, dated 25 Jan 2023"
+    effective_from: 20230215
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: TODO
+    downloaded: 20261126
+    text_layer: native
+    verified: true
+    derived_from: ""
+
+  - file: rights/dgca_car_m2_current.pdf
+    corpus: rights
+    title: "CAR Section 3 Series M Part II: Refund of Airline Tickets to Passengers of Public Transport Undertakings"
+    jurisdiction: IN
+    regulator: DGCA
+    authority: regulator
+    version: "Rev. 3, dated 24 Feb 2026"
+    effective_from: 20260326
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: TODO
+    downloaded: 20261126
+    text_layer: ocr
+    verified: true  # OCR text numbers/dates checked against page images 2026-11-26; OCR reads item "l)" as "1)"
+    derived_from: ""
+
+  - file: rights/dgca_atc_01_2024.md
+    corpus: rights
+    title: "Air Transport Circular 01 of 2024: Unbundle of services and fees by scheduled airlines"
+    jurisdiction: IN
+    regulator: DGCA
+    authority: regulator
+    version: "ATC 01 of 2024, dated 23 Apr 2024 (supersedes ATC 01 of 2021 dated 23 Feb 2021)"
+    effective_from: 20240423  # issue date; no separate effective date stated
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: TODO
+    downloaded: 20261126
+    text_layer: llm_transcription
+    verified: true  # checked by Claude Code against scan images, 2026-11-26 (not human-verified)
+    derived_from: "_pending/dgca_atc_01_2024.pdf"
+    notes: "Change bars in the scan mark paras 3.15 and 7 as changed vs ATC 01/2021. Spacing normalised; emblem, page numbers and change bars not transcribed."
+
+  - file: rights/eu261_2004.pdf
+    corpus: rights
+    title: "Regulation (EC) No 261/2004: common rules on compensation and assistance to passengers in the event of denied boarding and of cancellation or long delay of flights"
+    jurisdiction: EU
+    regulator: "European Parliament and Council"
+    authority: regulator
+    version: "Original text of 11 Feb 2004, OJ L 46, 17.2.2004"
+    effective_from: 20050217
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: https://eur-lex.europa.eu/eli/reg/2004/261/oj/eng
+    downloaded: 20261126
+    text_layer: native
+    verified: true
+    derived_from: ""
+
+  - file: rights/montreal_convention_1999.pdf
+    corpus: rights
+    title: "Convention for the Unification of Certain Rules for International Carriage by Air (Montreal, 28 May 1999)"
+    jurisdiction: MONTREAL
+    regulator: ICAO
+    authority: treaty
+    version: "1999 text; contains ORIGINAL liability limits"
+    effective_from: 20031104  # entry into force per ICAO list of parties
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: TODO
+    downloaded: 20261126
+    text_layer: native
+    verified: true
+    derived_from: ""
+
+  - file: rights/montreal_limits_2024.pdf
+    corpus: rights
+    title: "2024 Revised Limits of Liability Under the Montreal Convention 1999"
+    jurisdiction: MONTREAL
+    regulator: ICAO
+    authority: treaty
+    version: "2024 review under Article 24"
+    effective_from: 20241228
+    effective_to: 99991231  # assumed still in force; not verifiable from the PDF
+    url: https://www.icao.int/sites/default/files/secretariat/legal/LEB%20Treaty%20Collection%20Documents/2024_Revised_Limits_of_Liability_Under_the_Montreal_Convention_of_1999_en.pdf
+    downloaded: 20261126
+    text_layer: native
+    verified: true
+    derived_from: ""
