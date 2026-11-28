@@ -13,7 +13,7 @@ sources:
     version: "Rev. 4, dated 25 Jan 2023"
     effective_from: 20230215
     effective_to: 99991231  # assumed still in force; not verifiable from the PDF
-    url: TODO
+    url: https://www.dgca.gov.in/digigov-portal/Upload?flag=iframeAttachView&attachId=we1PSlOuQhYdHcwKKrm7ew%3D%3D
     downloaded: 20261126
     text_layer: native
     verified: true
@@ -28,7 +28,7 @@ sources:
     version: "Rev. 3, dated 24 Feb 2026"
     effective_from: 20260326
     effective_to: 99991231  # assumed still in force; not verifiable from the PDF
-    url: TODO
+    url: https://avantiscdnprodstorage.blob.core.windows.net/legalupdatedocs/53146/DGCA-issued-the-Civil-Aviation-Requirements-Section-3-Air-Transport-Series-M-Part-II-related-to-the-Refund-of-Airline-Tickets-to-Passengers-of-Public-Transport-Undertakings-Ferbruary272026.pdf  # unofficial mirror (Avantis); byte-identical to local file; official dgca.gov.in link not found
     downloaded: 20261126
     text_layer: ocr
     verified: true  # OCR text numbers/dates checked against page images 2026-11-26; OCR reads item "l)" as "1)"
@@ -43,7 +43,7 @@ sources:
     version: "ATC 01 of 2024, dated 23 Apr 2024 (supersedes ATC 01 of 2021 dated 23 Feb 2021)"
     effective_from: 20240423  # issue date; no separate effective date stated
     effective_to: 99991231  # assumed still in force; not verifiable from the PDF
-    url: TODO
+    url: https://avantiscdnprodstorage.blob.core.windows.net/legalupdatedocs/33185/DGCA_issued_a_notification_related_to_Unbundle_of_services_and_fees_by_scheduledairlines_Jul032024.pdf  # unofficial mirror (Avantis) of the scan in derived_from; byte-identical to local file; official dgca.gov.in link not found
     downloaded: 20261126
     text_layer: llm_transcription
     verified: true  # checked by Claude Code against scan images, 2026-11-26 (not human-verified)
@@ -74,11 +74,12 @@ sources:
     version: "1999 text; contains ORIGINAL liability limits"
     effective_from: 20031104  # entry into force per ICAO list of parties
     effective_to: 99991231  # assumed still in force; not verifiable from the PDF
-    url: TODO
+    url: https://www.iata.org/contentassets/fb1137ff561a4819a2d38f3db7308758/mc99-full-text.pdf
     downloaded: 20261126
     text_layer: native
     verified: true
     derived_from: ""
+    notes: "Liability amounts in Arts 21–22 are the ORIGINAL 1999 limits, superseded by montreal_limits_2024.pdf. Answers with amounts must use the 2024 limits."
 
   - file: rights/montreal_limits_2024.pdf
     corpus: rights
